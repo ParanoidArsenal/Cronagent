@@ -1,0 +1,143 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    stop_grace_period: 30s
+    shm_size: 128mb
+    environment:
+      POSTGRES_DB: cronagent
+      POSTGRES_USER: automation
+      POSTGRES_PASSWORD: automation
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U automation -d cronagent"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  web:
+    build: .
+    profiles: [prod]
+    restart: unless-stopped
+    stop_grace_period: 10s
+    ports:
+      - "3000:3000"
+    volumes:
+      # Mount automations — writable so the web UI can create/edit files
+      - ./automations:/app/automations
+      # Mount MCP config and servers
+      - ./mcp.json:/app/mcp.json:ro
+      - ./mcp-servers:/app/mcp-servers:ro
+      # Docker socket so the web service can spawn sandbox containers
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Mount Claude credentials read-only so the runner can read a fresh access
+      # token on every execution (survives host-side token refreshes).
+      - ${HOME}/.claude/.credentials.json:/home/claude/.claude/.credentials.json:ro
+      # SSH keys for git push to GitLab/GitHub from automations
+      - ${HOME}/.ssh:/home/claude/.ssh:ro
+    env_file: .env
+    environment:
+      - NODE_ENV=production
+      - AUTOMATIONS_DIR=/app/automations
+      - DATABASE_URL=postgresql://automation:automation@db:5432/cronagent
+      - MCP_CONFIG=/app/mcp.json
+      - SANDBOX_IMAGE=cronagent-sandbox
+      - HOME=/home/claude
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/api/stats || exit 1"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    depends_on:
+      db:
+        condition: service_healthy
+      sandbox-image:
+        condition: service_completed_successfully
+
+  # Cron daemon — runs scheduled automations
+  daemon:
+    build: .
+    restart: unless-stopped
+    stop_grace_period: 10s
+    command: ["node", "--import", "tsx", "src/index.ts", "daemon"]
+    volumes:
+      - ./automations:/app/automations:ro
+      - ./mcp.json:/app/mcp.json:ro
+      - ./mcp-servers:/app/mcp-servers:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${WORKSPACE_DIR:-/home/user/work}:${WORKSPACE_DIR:-/home/user/work}
+      # Mount Claude credentials read-only for fresh token reads (see `web` service).
+      - ${HOME}/.claude/.credentials.json:/home/claude/.claude/.credentials.json:ro
+      # SSH keys for git push to GitLab/GitHub from automations
+      - ${HOME}/.ssh:/home/claude/.ssh:ro
+    env_file: .env
+    environment:
+      - AUTOMATIONS_DIR=/app/automations
+      - DATABASE_URL=postgresql://automation:automation@db:5432/cronagent
+      - MCP_CONFIG=/app/mcp.json
+      - SANDBOX_IMAGE=cronagent-sandbox
+      - WORKSPACE_DIR=${WORKSPACE_DIR:-/home/user/work}
+    healthcheck:
+      test: ["CMD-SHELL", "node -e 'process.exit(0)' || exit 1"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    depends_on:
+      db:
+        condition: service_healthy
+      sandbox-image:
+        condition: service_completed_successfully
+
+  # One-shot service to build the sandbox image
+  sandbox-image:
+    image: docker:cli
+    command: ["docker", "build", "-t", "cronagent-sandbox", "-f", "sandbox.Dockerfile", "."]
+    working_dir: /workspace
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - .:/workspace:ro
+
+  # Dev mode — mounts source, Next.js hot reload, no image rebuild needed.
+  # Usage: docker compose --profile dev up
+  web-dev:
+    build:
+      context: .
+      target: dev
+    profiles: [dev]
+    restart: unless-stopped
+    stop_grace_period: 10s
+    working_dir: /app/web
+    entrypoint: ["/app/entrypoint.sh"]
+    command: ["npx", "next", "dev"]
+    ports:
+      - "3000:3000"
+    volumes:
+      - .:/app
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Workspace mount — non-sandbox automations need host filesystem access.
+      # Mounted at the same path so automation instructions work without translation.
+      - ${WORKSPACE_DIR:-/home/user/work}:${WORKSPACE_DIR:-/home/user/work}
+      # Mount Claude credentials read-only for fresh token reads (see `web` service).
+      - ${HOME}/.claude/.credentials.json:/home/claude/.claude/.credentials.json:ro
+      # SSH keys for git push to GitLab/GitHub from automations
+      - ${HOME}/.ssh:/home/claude/.ssh:ro
+    env_file: .env
+    environment:
+      - NODE_ENV=development
+      - AUTOMATIONS_DIR=/app/automations
+      - WORKSPACE_DIR=${WORKSPACE_DIR:-/home/user/work}
+      - DATABASE_URL=postgresql://automation:automation@db:5432/cronagent
+      - MCP_CONFIG=/app/mcp.json
+      - SANDBOX_IMAGE=cronagent-sandbox
+      - HOME=/home/claude
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:

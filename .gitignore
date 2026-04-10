@@ -1,0 +1,16 @@
+node_modules/
+logs/
+dist/
+*.log
+.next/
+web/node_modules/
+web/.next/
+web/playwright-report/
+web/test-results/
+test-results/
+web/blob-report/
+.env
+.env.mcp
+docker-compose.override.yml
+.claude/settings.local.json
+.claude

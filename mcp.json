@@ -1,0 +1,45 @@
+{
+  "mcpServers": {
+    "caila": {
+      "command": "node",
+      "args": [
+        "mcp-servers/caila/dist/index.js"
+      ],
+      "env": {
+        "CAILA_API_KEY": "${CAILA_API_KEY}",
+        "CAILA_BASE_URL": "${CAILA_BASE_URL}"
+      }
+    },
+    "gitlab": {
+      "command": "node",
+      "args": [
+        "mcp-servers/gitlab/dist/index.js"
+      ],
+      "env": {
+        "GITLAB_URL": "${GITLAB_URL}",
+        "GITLAB_TOKEN": "${GITLAB_TOKEN}"
+      }
+    },
+    "jira": {
+      "command": "node",
+      "args": [
+        "mcp-servers/jira/dist/index.js"
+      ],
+      "env": {
+        "JIRA_URL": "${JIRA_URL}",
+        "JIRA_TOKEN": "${JIRA_TOKEN}",
+        "JIRA_JSESSIONID": "${JIRA_JSESSIONID}"
+      }
+    },
+    "mattermost": {
+      "command": "node",
+      "args": [
+        "mcp-servers/mattermost/dist/index.js"
+      ],
+      "env": {
+        "MATTERMOST_URL": "${MATTERMOST_URL}",
+        "MATTERMOST_TOKEN": "${MATTERMOST_TOKEN}"
+      }
+    }
+  }
+}

@@ -1,0 +1,58 @@
+# Dependencies
+node_modules
+**/node_modules
+
+# Build outputs
+web/.next
+/dist
+
+# Git
+.git
+.gitignore
+
+# Docs
+*.md
+!README.md
+
+# Logs
+*.log
+logs/
+
+# IDE
+.idea
+.vscode
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+
+# Local development
+.env
+.env.local
+.env.development
+.env.mcp.example
+
+# Database files
+*.db
+*.sqlite
+
+# Docker
+Jenkinsfile
+docker-compose*.yml
+.dockerignore
+sandbox.Dockerfile
+build.sh
+
+# Tests
+tests/
+web/tests/
+web/playwright.config.ts
+
+# Workflow docs
+workflow/

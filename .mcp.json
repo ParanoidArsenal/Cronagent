@@ -1,0 +1,20 @@
+{
+  "mcpServers": {
+    "jira": {
+      "command": "bash",
+      "args": ["scripts/run-mcp.sh", "jira"]
+    },
+    "gitlab": {
+      "command": "bash",
+      "args": ["scripts/run-mcp.sh", "gitlab"]
+    },
+    "mattermost": {
+      "command": "bash",
+      "args": ["scripts/run-mcp.sh", "mattermost"]
+    },
+    "caila": {
+      "command": "bash",
+      "args": ["scripts/run-mcp.sh", "caila"]
+    }
+  }
+}

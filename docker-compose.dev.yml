@@ -1,0 +1,40 @@
+# Development override — use with:
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up
+#
+# Provides hot-reload for both web (Next.js HMR) and daemon (node --watch).
+# Copy .env.example to .env and fill in your credentials before starting.
+
+services:
+  web:
+    working_dir: /app/web
+    command: ["npx", "next", "dev"]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      - NODE_ENV=development
+    volumes:
+      # Source mounts for hot-reload
+      - ./src:/app/src
+      - ./web/app:/app/web/app
+      - ./web/lib:/app/web/lib
+      - ./web/components:/app/web/components
+      - ./web/public:/app/web/public
+      # Prevent host .next from shadowing container build
+      - web_next:/app/web/.next
+    healthcheck:
+      # Dev server may be slower to start
+      start_period: 30s
+
+  daemon:
+    command: ["node", "--import", "tsx", "--watch", "src/index.ts", "daemon"]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      - NODE_ENV=development
+    volumes:
+      - ./src:/app/src
+
+volumes:
+  web_next:
