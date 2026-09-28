@@ -15,13 +15,112 @@ if (!GITLAB_TOKEN) {
   process.exit(1);
 }
 
+const HTTP_TIMEOUT_MS = (() => {
+  const n = Number(process.env.MCP_HTTP_TIMEOUT_MS);
+  return Number.isFinite(n) && n > 0 ? n : 30_000;
+})();
+
+function isTimeoutError(err: unknown): boolean {
+  return (
+    err instanceof Error &&
+    (err.name === "TimeoutError" || err.name === "AbortError")
+  );
+}
+
+// ==================== Argument validation ====================
+
+class ToolArgError extends Error {}
+
+/**
+ * Lightweight runtime check of tool arguments against the tool's own
+ * inputSchema (required fields + top-level primitive types + enum).
+ * Numeric strings are coerced for "number" fields and numbers for "string"
+ * fields. Throws ToolArgError.
+ */
+function validateArgs(
+  schema: { properties?: Record<string, any>; required?: string[] },
+  rawArgs: unknown
+): Record<string, any> {
+  if (rawArgs != null && (typeof rawArgs !== "object" || Array.isArray(rawArgs))) {
+    throw new ToolArgError("arguments must be an object");
+  }
+  const args: Record<string, any> = { ...((rawArgs as Record<string, any>) ?? {}) };
+  const props = schema.properties ?? {};
+  for (const key of schema.required ?? []) {
+    const v = args[key];
+    if (v === undefined || v === null || (typeof v === "string" && v.trim() === "")) {
+      throw new ToolArgError(`missing required argument '${key}'`);
+    }
+  }
+  for (const [key, def] of Object.entries(props)) {
+    const v = args[key];
+    if (v === undefined || v === null) continue;
+    const expected = def?.type;
+    let ok = true;
+    switch (expected) {
+      case "string":
+        if (typeof v === "number" && Number.isFinite(v)) args[key] = String(v);
+        ok = typeof args[key] === "string";
+        break;
+      case "number":
+      case "integer":
+        if (typeof v === "string" && v.trim() !== "" && Number.isFinite(Number(v))) {
+          args[key] = Number(v);
+        }
+        ok = typeof args[key] === "number" && Number.isFinite(args[key]) &&
+          (expected !== "integer" || Number.isInteger(args[key]));
+        break;
+      case "boolean":
+        ok = typeof v === "boolean";
+        break;
+      case "array":
+        ok = Array.isArray(v);
+        break;
+      case "object":
+        ok = typeof v === "object" && !Array.isArray(v);
+        break;
+    }
+    if (!ok) {
+      throw new ToolArgError(
+        `argument '${key}' must be of type ${expected}, got ${Array.isArray(v) ? "array" : typeof v}`
+      );
+    }
+    if (Array.isArray(def?.enum) && !def.enum.includes(args[key])) {
+      throw new ToolArgError(
+        `argument '${key}' must be one of: ${def.enum.join(", ")}`
+      );
+    }
+  }
+  return args;
+}
+
+/** Encode an LLM-supplied value for use as a single URL path segment. */
+const seg = (v: string | number) => encodeURIComponent(String(v));
+
 // ==================== GitLab API ====================
 
-async function gitlabRequest(
+interface GitLabPage<T = any> {
+  data: T;
+  total: number | null;
+  totalPages: number | null;
+  page: number | null;
+  perPage: number | null;
+  nextPage: number | null;
+}
+
+function intHeader(res: Response, name: string): number | null {
+  const v = res.headers.get(name);
+  if (v == null || v.trim() === "") return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+/** Like gitlabRequest, but also returns GitLab pagination headers. */
+async function gitlabRequestPaged<T = any>(
   method: string,
   endpoint: string,
   body?: any
-): Promise<any> {
+): Promise<GitLabPage<T>> {
   const url = `${GITLAB_URL}/api/v4${endpoint}`;
   const headers: Record<string, string> = {
     "PRIVATE-TOKEN": GITLAB_TOKEN!,
@@ -29,18 +128,44 @@ async function gitlabRequest(
   if (body) {
     headers["Content-Type"] = "application/json";
   }
-  const res = await fetch(url, {
-    method,
-    headers,
-    body: body ? JSON.stringify(body) : undefined,
-  });
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(
-      `GitLab API ${method} ${endpoint}: ${res.status} ${text}`
-    );
+  try {
+    const res = await fetch(url, {
+      method,
+      headers,
+      body: body ? JSON.stringify(body) : undefined,
+      signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
+    });
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(
+        `GitLab API ${method} ${endpoint}: ${res.status} ${text}`
+      );
+    }
+    const data = (await res.json()) as T;
+    return {
+      data,
+      total: intHeader(res, "x-total"),
+      totalPages: intHeader(res, "x-total-pages"),
+      page: intHeader(res, "x-page"),
+      perPage: intHeader(res, "x-per-page"),
+      nextPage: intHeader(res, "x-next-page"),
+    };
+  } catch (err) {
+    if (isTimeoutError(err)) {
+      throw new Error(
+        `GitLab API ${method} ${endpoint}: request timed out after ${HTTP_TIMEOUT_MS}ms (set MCP_HTTP_TIMEOUT_MS to change)`
+      );
+    }
+    throw err;
   }
-  return res.json();
+}
+
+async function gitlabRequest(
+  method: string,
+  endpoint: string,
+  body?: any
+): Promise<any> {
+  return (await gitlabRequestPaged(method, endpoint, body)).data;
 }
 
 // ==================== GitLab MR helpers ====================
@@ -71,19 +196,46 @@ interface GitLabMR {
   } | null;
 }
 
-async function searchMergeRequests(issueKey: string): Promise<GitLabMR[]> {
-  const searchResults = await gitlabRequest(
-    "GET",
-    `/merge_requests?scope=all&state=opened&search=${encodeURIComponent(issueKey)}&per_page=50`
-  );
+const SEARCH_PER_PAGE = 100;
+const SEARCH_MAX_PAGES = 5;
 
-  if (!Array.isArray(searchResults) || searchResults.length === 0) {
-    return [];
+interface MRSearchResult {
+  mrs: GitLabMR[];
+  /** Total number of search hits reported by GitLab (before source_branch filtering), if known. */
+  total_search_hits: number | null;
+  /** Number of search hits actually scanned. */
+  scanned: number;
+  /** True if more search hits exist beyond what was scanned. */
+  truncated: boolean;
+}
+
+async function searchMergeRequests(issueKey: string): Promise<MRSearchResult> {
+  const searchResults: any[] = [];
+  let total: number | null = null;
+  let truncated = false;
+  let page = 1;
+  while (true) {
+    const res = await gitlabRequestPaged<any[]>(
+      "GET",
+      `/merge_requests?scope=all&state=opened&search=${encodeURIComponent(issueKey)}&per_page=${SEARCH_PER_PAGE}&page=${page}`
+    );
+    if (!Array.isArray(res.data)) break;
+    searchResults.push(...res.data);
+    if (res.total != null) total = res.total;
+    const next =
+      res.nextPage ??
+      (res.totalPages != null && page < res.totalPages ? page + 1 : null);
+    if (next == null || next <= page || res.data.length === 0) break;
+    if (page >= SEARCH_MAX_PAGES) {
+      truncated = true;
+      break;
+    }
+    page = next;
   }
 
   const keyLower = issueKey.toLowerCase();
   const matching = searchResults.filter((mr: any) =>
-    mr.source_branch.toLowerCase().includes(keyLower)
+    String(mr.source_branch ?? "").toLowerCase().includes(keyLower)
   );
 
   const detailed: GitLabMR[] = [];
@@ -91,7 +243,7 @@ async function searchMergeRequests(issueKey: string): Promise<GitLabMR[]> {
     try {
       const full = await gitlabRequest(
         "GET",
-        `/projects/${mr.project_id}/merge_requests/${mr.iid}`
+        `/projects/${seg(mr.project_id)}/merge_requests/${seg(mr.iid)}`
       );
       detailed.push(full);
     } catch {
@@ -99,7 +251,16 @@ async function searchMergeRequests(issueKey: string): Promise<GitLabMR[]> {
     }
   }
 
-  return detailed;
+  return {
+    mrs: detailed,
+    total_search_hits: total,
+    scanned: searchResults.length,
+    truncated,
+  };
+}
+
+function truncationHint(r: MRSearchResult): string {
+  return `More results exist: scanned ${r.scanned} of ${r.total_search_hits ?? "unknown"} search hits (limit ${SEARCH_PER_PAGE * SEARCH_MAX_PAGES}); some matching MRs may be missing. Use a more specific issue key.`;
 }
 
 function formatMR(mr: GitLabMR) {
@@ -140,8 +301,7 @@ const server = new Server(
   { capabilities: { tools: {} } }
 );
 
-server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: [
+const TOOLS = [
     // --- Merge Requests ---
     {
       name: "search_merge_requests",
@@ -330,6 +490,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: "number",
             description: "Number of results per page (max 100). Default: 50.",
           },
+          page: {
+            type: "number",
+            description:
+              "Page number (1-based) for fetching further results when the response reports more_results. Default: 1.",
+          },
         },
         required: [],
       },
@@ -508,26 +673,49 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ["project_id", "iid", "discussion_id", "body"],
       },
     },
-  ],
+];
+
+server.setRequestHandler(ListToolsRequestSchema, async () => ({
+  tools: TOOLS,
 }));
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args } = request.params;
+  const { name, arguments: rawArgs } = request.params;
 
   try {
+    const tool = TOOLS.find((t) => t.name === name);
+    let args: Record<string, any> | undefined = rawArgs;
+    if (tool) {
+      try {
+        args = validateArgs(tool.inputSchema, rawArgs);
+      } catch (err) {
+        if (err instanceof ToolArgError) {
+          return {
+            content: [
+              { type: "text", text: `Invalid arguments for ${name}: ${err.message}` },
+            ],
+            isError: true,
+          };
+        }
+        throw err;
+      }
+    }
     switch (name) {
       // --- Merge Requests ---
 
       case "search_merge_requests": {
         const { issue_key } = args as { issue_key: string };
-        const mrs = await searchMergeRequests(issue_key);
+        const search = await searchMergeRequests(issue_key);
+        const mrs = search.mrs;
 
         if (mrs.length === 0) {
           return {
             content: [
               {
                 type: "text",
-                text: `No open merge requests found for issue key: ${issue_key}`,
+                text:
+                  `No open merge requests found for issue key: ${issue_key}` +
+                  (search.truncated ? `\n${truncationHint(search)}` : ""),
               },
             ],
           };
@@ -537,7 +725,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           content: [
             {
               type: "text",
-              text: JSON.stringify(mrs.map(formatMR), null, 2),
+              text: JSON.stringify(
+                {
+                  total: mrs.length,
+                  total_search_hits: search.total_search_hits,
+                  more_results: search.truncated,
+                  ...(search.truncated ? { hint: truncationHint(search) } : {}),
+                  merge_requests: mrs.map(formatMR),
+                },
+                null,
+                2
+              ),
             },
           ],
         };
@@ -550,7 +748,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
         const mr = await gitlabRequest(
           "GET",
-          `/projects/${project_id}/merge_requests/${iid}`
+          `/projects/${seg(project_id)}/merge_requests/${seg(iid)}`
         );
 
         return {
@@ -570,7 +768,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
         const approvals = await gitlabRequest(
           "GET",
-          `/projects/${project_id}/merge_requests/${iid}/approvals`
+          `/projects/${seg(project_id)}/merge_requests/${seg(iid)}/approvals`
         );
 
         return {
@@ -604,7 +802,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
         const mrWithChanges = await gitlabRequest(
           "GET",
-          `/projects/${project_id}/merge_requests/${iid}/changes`
+          `/projects/${seg(project_id)}/merge_requests/${seg(iid)}/changes`
         );
 
         const changes = (mrWithChanges.changes || []).map((c: any) => ({
@@ -653,7 +851,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         const result = await gitlabRequest(
           "PUT",
-          `/projects/${project_id}/merge_requests/${iid}/merge`,
+          `/projects/${seg(project_id)}/merge_requests/${seg(iid)}/merge`,
           {
             squash: squash ?? false,
             should_remove_source_branch:
@@ -740,7 +938,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         const result = await gitlabRequest(
           "PUT",
-          `/projects/${project_id}/merge_requests/${iid}`,
+          `/projects/${seg(project_id)}/merge_requests/${seg(iid)}`,
           updateBody
         );
 
@@ -767,33 +965,46 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       // --- List My MRs ---
 
       case "list_my_merge_requests": {
-        const { state, updated_after, merged_after, per_page } = args as {
+        const { state, updated_after, merged_after, per_page, page } = args as {
           state?: string;
           updated_after?: string;
           merged_after?: string;
           per_page?: number;
+          page?: number;
         };
+
+        const perPage = Math.min(100, Math.max(1, Math.floor(per_page || 50)));
+        const pageNum = Math.max(1, Math.floor(page || 1));
 
         const params = new URLSearchParams();
         params.set("scope", "created_by_me");
         params.set("state", state || "opened");
-        params.set("per_page", String(per_page || 50));
+        params.set("per_page", String(perPage));
+        params.set("page", String(pageNum));
         if (updated_after) params.set("updated_after", updated_after);
         if (merged_after && (state === "merged" || state === "all")) {
           params.set("merged_after", merged_after);
         }
 
-        const mrs: GitLabMR[] = await gitlabRequest(
+        const res = await gitlabRequestPaged<GitLabMR[]>(
           "GET",
           `/merge_requests?${params.toString()}`
         );
+        const mrs = Array.isArray(res.data) ? res.data : [];
+
+        const nextPage =
+          res.nextPage ??
+          (res.totalPages != null && pageNum < res.totalPages
+            ? pageNum + 1
+            : null);
+        const moreResults = nextPage != null;
 
         if (mrs.length === 0) {
           return {
             content: [
               {
                 type: "text",
-                text: `No merge requests found (state: ${state || "opened"})`,
+                text: `No merge requests found (state: ${state || "opened"}, page: ${pageNum}${res.total != null ? `, total: ${res.total}` : ""})`,
               },
             ],
           };
@@ -811,7 +1022,24 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           content: [
             {
               type: "text",
-              text: JSON.stringify(formatted, null, 2),
+              text: JSON.stringify(
+                {
+                  total: res.total,
+                  total_pages: res.totalPages,
+                  page: pageNum,
+                  per_page: perPage,
+                  returned: formatted.length,
+                  more_results: moreResults,
+                  ...(moreResults
+                    ? {
+                        hint: `More results exist${res.total != null ? ` (${res.total} total)` : ""}: call again with page=${nextPage} to get the next page.`,
+                      }
+                    : {}),
+                  merge_requests: formatted,
+                },
+                null,
+                2
+              ),
             },
           ],
         };
@@ -829,10 +1057,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           };
 
         const shouldWait = wait_for_pipelines ?? false;
-        const intervalSec = poll_interval ?? 30;
-        const timeoutSec = timeout ?? 600;
+        // Clamp agent-supplied values: poll every 5..300s, wait at most 1800s.
+        const intervalSec = Math.min(300, Math.max(5, poll_interval ?? 30));
+        const timeoutSec = Math.min(1800, Math.max(0, timeout ?? 600));
 
-        const mrs = await searchMergeRequests(issue_key);
+        const search = await searchMergeRequests(issue_key);
+        const mrs = search.mrs;
 
         if (mrs.length === 0) {
           return {
@@ -847,6 +1077,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                   has_conflicts: false,
                   status: "no_mrs",
                   mrs: [],
+                  ...(search.truncated
+                    ? { more_results: true, hint: truncationHint(search) }
+                    : {}),
                 }, null, 2),
               },
             ],
@@ -887,7 +1120,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               try {
                 const full = await gitlabRequest(
                   "GET",
-                  `/projects/${mr.project_id}/merge_requests/${mr.iid}`
+                  `/projects/${seg(mr.project_id)}/merge_requests/${seg(mr.iid)}`
                 );
                 refreshed.push(full);
               } catch {
@@ -904,7 +1137,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             try {
               approvals = await gitlabRequest(
                 "GET",
-                `/projects/${mr.project_id}/merge_requests/${mr.iid}/approvals`
+                `/projects/${seg(mr.project_id)}/merge_requests/${seg(mr.iid)}/approvals`
               );
             } catch {
               approvals = {
@@ -967,6 +1200,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                   has_conflicts: hasConflicts,
                   status: readyToMerge ? "ready" : "not_ready",
                   mrs: mrResults,
+                  ...(search.truncated
+                    ? { more_results: true, hint: truncationHint(search) }
+                    : {}),
                 },
                 null,
                 2
@@ -986,7 +1222,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         const discussions = await gitlabRequest(
           "GET",
-          `/projects/${project_id}/merge_requests/${iid}/discussions?per_page=100`
+          `/projects/${seg(project_id)}/merge_requests/${seg(iid)}/discussions?per_page=100`
         );
 
         const formatted = (discussions as any[]).map((d: any) => ({
@@ -1067,7 +1303,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         const result = await gitlabRequest(
           "POST",
-          `/projects/${project_id}/merge_requests/${iid}/discussions`,
+          `/projects/${seg(project_id)}/merge_requests/${seg(iid)}/discussions`,
           requestBody
         );
 
@@ -1105,7 +1341,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         const result = await gitlabRequest(
           "PUT",
-          `/projects/${project_id}/merge_requests/${iid}/discussions/${discussion_id}`,
+          `/projects/${seg(project_id)}/merge_requests/${seg(iid)}/discussions/${seg(discussion_id)}`,
           { resolved }
         );
 
@@ -1140,7 +1376,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         const result = await gitlabRequest(
           "POST",
-          `/projects/${project_id}/merge_requests/${iid}/discussions/${discussion_id}/notes`,
+          `/projects/${seg(project_id)}/merge_requests/${seg(iid)}/discussions/${seg(discussion_id)}/notes`,
           { body }
         );
 

@@ -206,6 +206,26 @@ describe('Runner', () => {
     });
   });
 
+  describe('stop signal in shell mode', () => {
+    it('passes cancelSignal to execa and stops before the next step', async () => {
+      const controller = new AbortController();
+      execaMock.mockImplementationOnce(async () => {
+        controller.abort(); // user hits Stop while step 1 runs
+        return { exitCode: undefined, stdout: '', stderr: '' };
+      });
+
+      const result = await runner.execute(
+        makeAutomation({ instructions: 'echo one\necho two' }),
+        undefined, undefined, undefined, controller.signal,
+      );
+
+      expect(execaMock).toHaveBeenCalledTimes(1);
+      expect(execaMock.mock.calls[0][2].cancelSignal).toBe(controller.signal);
+      expect(result.success).toBe(false);
+      expect(result.error).toBe('Run stopped by user');
+    });
+  });
+
   describe('claude mode CLI invocation', () => {
     it('pipes prompt via stdin, not --prompt-file', async () => {
       // Mock execa to return an async iterable (stream-json lines) then resolve

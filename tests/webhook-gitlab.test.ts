@@ -3,7 +3,8 @@
  * web/app/api/webhook/gitlab/route.ts.
  *
  * The handler:
- *   1. Validates X-Gitlab-Token against GITLAB_WEBHOOK_SECRET
+ *   1. Validates X-Gitlab-Token against GITLAB_WEBHOOK_SECRET (required —
+ *      rejects with 503 when the secret is not configured)
  *   2. Normalizes the X-Gitlab-Event header into a short event type string
  *   3. Parses the JSON body and extracts convenience env vars
  *   4. Loads automations, filters to trigger === 'webhook'
@@ -111,18 +112,24 @@ import { POST } from '../web/app/api/webhook/gitlab/route.ts';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+/** Secret configured in beforeEach; makeRequest sends it by default. */
+const TEST_SECRET = 'test-webhook-secret';
+
 /**
  * Build a minimal request-like object that satisfies the interface used by
  * the route handler: headers.get() and json().
+ *
+ * gitlabToken defaults to TEST_SECRET; pass null to omit the header.
  */
 function makeRequest(options: {
-  gitlabToken?: string;
+  gitlabToken?: string | null;
   gitlabEvent?: string;
   body?: unknown;
 }) {
   const headers: Record<string, string> = {};
-  if (options.gitlabToken !== undefined) {
-    headers['x-gitlab-token'] = options.gitlabToken;
+  const token = options.gitlabToken === undefined ? TEST_SECRET : options.gitlabToken;
+  if (token !== null) {
+    headers['x-gitlab-token'] = token;
   }
   if (options.gitlabEvent !== undefined) {
     headers['x-gitlab-event'] = options.gitlabEvent;
@@ -158,8 +165,8 @@ describe('POST /api/webhook/gitlab', () => {
     // Default: no automations, triggerRun resolves to started:true
     mockGetAutomations.mockResolvedValue([]);
     mockTriggerRun.mockResolvedValue({ started: true });
-    // Clear env secret between tests
-    delete process.env.GITLAB_WEBHOOK_SECRET;
+    // Secret is required; configure it for every test by default
+    process.env.GITLAB_WEBHOOK_SECRET = TEST_SECRET;
   });
 
   afterEach(() => {
@@ -187,7 +194,7 @@ describe('POST /api/webhook/gitlab', () => {
 
     it('returns 401 when secret is set and token is missing entirely', async () => {
       process.env.GITLAB_WEBHOOK_SECRET = 'correct-secret';
-      const req = makeRequest({ gitlabEvent: 'Push Hook' }); // no token header
+      const req = makeRequest({ gitlabToken: null, gitlabEvent: 'Push Hook' }); // no token header
 
       const res = await POST(req);
 
@@ -203,13 +210,59 @@ describe('POST /api/webhook/gitlab', () => {
       expect(res.status).toBe(200);
     });
 
-    it('returns 200 when GITLAB_WEBHOOK_SECRET is not set (open endpoint)', async () => {
-      // env var already deleted in beforeEach
-      const req = makeRequest({ gitlabEvent: 'Push Hook' }); // no token needed
+    it('returns 401 when token differs only in length (prefix of secret)', async () => {
+      process.env.GITLAB_WEBHOOK_SECRET = 'correct-secret';
+      const req = makeRequest({ gitlabToken: 'correct', gitlabEvent: 'Push Hook' });
 
       const res = await POST(req);
 
-      expect(res.status).toBe(200);
+      expect(res.status).toBe(401);
+    });
+
+    it('returns 401 when token is an empty string', async () => {
+      process.env.GITLAB_WEBHOOK_SECRET = 'correct-secret';
+      const req = makeRequest({ gitlabToken: '', gitlabEvent: 'Push Hook' });
+
+      const res = await POST(req);
+
+      expect(res.status).toBe(401);
+    });
+
+    it('returns 503 when GITLAB_WEBHOOK_SECRET is not set (fails closed)', async () => {
+      delete process.env.GITLAB_WEBHOOK_SECRET;
+      const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+      mockGetAutomations.mockResolvedValue([makeWebhookAutomation('job-a')]);
+      const req = makeRequest({ gitlabToken: null, gitlabEvent: 'Push Hook' });
+
+      const res = await POST(req);
+
+      expect(res.status).toBe(503);
+      const body = await res.json();
+      expect(body.error).toMatch(/GITLAB_WEBHOOK_SECRET/);
+      expect(errSpy).toHaveBeenCalled();
+      expect(mockTriggerRun).not.toHaveBeenCalled();
+      errSpy.mockRestore();
+    });
+
+    it('returns 503 when GITLAB_WEBHOOK_SECRET is empty, even if a token is sent', async () => {
+      process.env.GITLAB_WEBHOOK_SECRET = '';
+      const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+      const req = makeRequest({ gitlabToken: '', gitlabEvent: 'Push Hook' });
+
+      const res = await POST(req);
+
+      expect(res.status).toBe(503);
+      errSpy.mockRestore();
+    });
+
+    it('does not trigger automations when token is wrong', async () => {
+      mockGetAutomations.mockResolvedValue([makeWebhookAutomation('job-a')]);
+      const req = makeRequest({ gitlabToken: 'nope', gitlabEvent: 'Push Hook' });
+
+      const res = await POST(req);
+
+      expect(res.status).toBe(401);
+      expect(mockTriggerRun).not.toHaveBeenCalled();
     });
   });
 

@@ -91,6 +91,11 @@ type ModeResult =
       error: string;
       logFile?: string;
       isRateLimit: boolean;
+      // A failed Claude attempt may still have spent tokens (e.g. is_error
+      // result, max-turns, non-zero exit after partial work).
+      costUsd?: number;
+      inputTokens?: number;
+      outputTokens?: number;
     };
 
 /**
@@ -188,11 +193,11 @@ export class Runner {
       );
 
       // Accumulate token/cost totals whether the attempt succeeded or not.
-      if (result.ok) {
-        if (result.costUsd !== undefined) totalCostUsd = (totalCostUsd ?? 0) + result.costUsd;
-        if (result.inputTokens !== undefined) totalInputTokens = (totalInputTokens ?? 0) + result.inputTokens;
-        if (result.outputTokens !== undefined) totalOutputTokens = (totalOutputTokens ?? 0) + result.outputTokens;
+      if (result.costUsd !== undefined) totalCostUsd = (totalCostUsd ?? 0) + result.costUsd;
+      if (result.inputTokens !== undefined) totalInputTokens = (totalInputTokens ?? 0) + result.inputTokens;
+      if (result.outputTokens !== undefined) totalOutputTokens = (totalOutputTokens ?? 0) + result.outputTokens;
 
+      if (result.ok) {
         const execResult: ExecutionResult = {
           automationName: automation.name,
           success: true,
@@ -268,9 +273,9 @@ export class Runner {
       );
     }
     if (automation.mode === 'caila') {
-      return wrapThrowing(() => this.executeCailaMode(automation, mergedEnv));
+      return wrapThrowing(() => this.executeCailaMode(automation, mergedEnv, signal));
     }
-    return wrapThrowing(() => this.executeShellMode(automation, useSandbox, mergedEnv));
+    return wrapThrowing(() => this.executeShellMode(automation, useSandbox, mergedEnv, signal));
   }
 
   /**
@@ -334,9 +339,16 @@ export class Runner {
             timeout: 30_000,
             env,
             reject: false,
+            cancelSignal: signal,
           });
           if (pcResult.stdout) {
             preCollectOutput = String(pcResult.stdout);
+          }
+          if (pcResult.exitCode !== 0) {
+            logger.warn(
+              { name: automation.name, exitCode: pcResult.exitCode, stderr: String(pcResult.stderr ?? '').slice(0, 1000) },
+              'Pre-collect exited non-zero, continuing',
+            );
           }
           logger.info(
             { name: automation.name, preCollectLen: preCollectOutput.length },
@@ -488,7 +500,9 @@ export class Runner {
       try {
         await mkdir(LOGS_DIR, { recursive: true });
         const ts = new Date().toISOString().replace(/[:.]/g, '-');
-        logFile = join(LOGS_DIR, `${automation.name}_${ts}.log`);
+        // The name comes from user-editable frontmatter — keep it to a single safe path segment.
+        const safeName = automation.name.replace(/[^A-Za-z0-9._-]/g, '_');
+        logFile = join(LOGS_DIR, `${safeName}_${ts}.log`);
       } catch {
         logger.warn({ name: automation.name }, 'Failed to create logs directory');
       }
@@ -539,12 +553,16 @@ export class Runner {
       // proc iteration completes when process exits; get the result
       const result = await proc;
 
-      // Build a failed ModeResult with the current logFile attached.
+      // Build a failed ModeResult with the current logFile and whatever
+      // spend the stream reported, so failed attempts still count toward budget.
       const failure = (msg: string): ModeResult => ({
         ok: false,
         error: msg,
         logFile,
         isRateLimit: isRateLimitMessage(msg),
+        costUsd,
+        inputTokens,
+        outputTokens,
       });
 
       // Detect spawn failures (e.g. ENOENT when claude CLI is not installed)
@@ -609,6 +627,7 @@ export class Runner {
   private async executeCailaMode(
     automation: Automation,
     env: Record<string, string | undefined>,
+    signal?: AbortSignal,
   ): Promise<{ output: string; costUsd?: number; inputTokens?: number; outputTokens?: number }> {
     const apiKey = env.CAILA_API_KEY as string | undefined;
     const baseUrl = env.CAILA_BASE_URL as string | undefined;
@@ -634,6 +653,9 @@ export class Runner {
 
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), automation.timeout * 1000);
+    const onAbort = () => controller.abort();
+    signal?.addEventListener('abort', onAbort, { once: true });
+    if (signal?.aborted) controller.abort();
 
     try {
       const res = await fetch(url, {
@@ -686,11 +708,13 @@ export class Runner {
       };
     } catch (err) {
       if (err instanceof Error && err.name === 'AbortError') {
+        if (signal?.aborted) throw new Error('Run stopped by user');
         throw new Error(`CAILA request timed out after ${automation.timeout}s`);
       }
       throw err;
     } finally {
       clearTimeout(timeoutId);
+      signal?.removeEventListener('abort', onAbort);
     }
   }
 
@@ -700,6 +724,7 @@ export class Runner {
     automation: Automation,
     sandbox: boolean,
     env: Record<string, string | undefined>,
+    signal?: AbortSignal,
   ): Promise<{ output: string; costUsd?: number; inputTokens?: number; outputTokens?: number }> {
     const lines = automation.instructions.split('\n');
     const outputs: string[] = [];
@@ -707,6 +732,7 @@ export class Runner {
     for (const line of lines) {
       const trimmed = line.trim();
       if (!trimmed || trimmed.startsWith('on_failure:')) continue;
+      if (signal?.aborted) throw new Error('Run stopped by user');
 
       // HTTP step — execute via native fetch, bypass shell/sandbox
       if (trimmed.startsWith('http: ')) {
@@ -716,6 +742,8 @@ export class Runner {
         const controller = new AbortController();
         const timeoutMs = (httpConfig.timeout ?? 30) * 1000;
         const timer = setTimeout(() => controller.abort(), timeoutMs);
+        const onAbort = () => controller.abort();
+        signal?.addEventListener('abort', onAbort, { once: true });
 
         try {
           const bodyStr = httpConfig.body != null
@@ -740,8 +768,12 @@ export class Runner {
           if (!response.ok) {
             throw new Error(`HTTP ${response.status} ${response.statusText}: ${responseBody.slice(0, 500)}`);
           }
+        } catch (err) {
+          if (signal?.aborted) throw new Error('Run stopped by user');
+          throw err;
         } finally {
           clearTimeout(timer);
+          signal?.removeEventListener('abort', onAbort);
         }
         continue;
       }
@@ -762,9 +794,11 @@ export class Runner {
           timeout: (automation.timeout + 10) * 1000,
           env,
           reject: false,
+          cancelSignal: signal,
         });
 
         if (proc.stdout) outputs.push(proc.stdout);
+        if (signal?.aborted) throw new Error('Run stopped by user');
 
         if (proc.exitCode !== 0) {
           const errorMsg = proc.stderr || `Sandbox command failed with exit code ${proc.exitCode}`;
@@ -775,9 +809,11 @@ export class Runner {
           timeout: automation.timeout * 1000,
           env,
           reject: false,
+          cancelSignal: signal,
         });
 
         if (proc.stdout) outputs.push(proc.stdout);
+        if (signal?.aborted) throw new Error('Run stopped by user');
 
         if (proc.exitCode !== 0) {
           const errorMsg = proc.stderr || `Command failed with exit code ${proc.exitCode}`;
@@ -806,7 +842,9 @@ export function buildDockerArgs(opts: DockerRunOpts): string[] {
     'run',
     '--rm',
     ...(opts.stdin ? ['-i'] : []),
-    '--network', 'host',
+    // Default bridge network: outbound internet works, but host loopback
+    // services (Postgres, the web API) are not reachable from the sandbox.
+    '--network', process.env.SANDBOX_NETWORK || 'bridge',
     '--memory', '1g',
     '--cpus', '1',
     '--pids-limit', '256',

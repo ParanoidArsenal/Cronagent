@@ -9,6 +9,7 @@ web/playwright-report/
 web/test-results/
 test-results/
 web/blob-report/
+*.tsbuildinfo
 .env
 .env.mcp
 docker-compose.override.yml

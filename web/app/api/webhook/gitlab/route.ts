@@ -1,4 +1,5 @@
 import { NextRequest } from 'next/server';
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { getAutomations, triggerRun } from '@/lib/backend';
 
 /**
@@ -9,7 +10,8 @@ import { getAutomations, triggerRun } from '@/lib/backend';
  *
  * GitLab webhook setup:
  *   URL: https://<host>/api/webhook/gitlab
- *   Secret token: value of GITLAB_WEBHOOK_SECRET env var
+ *   Secret token: value of GITLAB_WEBHOOK_SECRET env var (required — the
+ *   endpoint rejects all requests with 503 when it is not configured)
  */
 
 // GitLab event header → normalized short name
@@ -27,14 +29,27 @@ const EVENT_MAP: Record<string, string> = {
   'Wiki Page Hook': 'wiki_page',
 };
 
+/** Constant-time string comparison (SHA-256 digests are always equal length). */
+function tokensMatch(token: string, secret: string): boolean {
+  const a = createHash('sha256').update(token).digest();
+  const b = createHash('sha256').update(secret).digest();
+  return timingSafeEqual(a, b);
+}
+
 export async function POST(req: NextRequest) {
-  // Validate secret token if configured
+  // Fail closed: the secret token is required
   const secret = process.env.GITLAB_WEBHOOK_SECRET;
-  if (secret) {
-    const token = req.headers.get('x-gitlab-token');
-    if (token !== secret) {
-      return Response.json({ error: 'Unauthorized' }, { status: 401 });
-    }
+  if (!secret) {
+    console.error('[webhook/gitlab] GITLAB_WEBHOOK_SECRET is not set — rejecting webhook request');
+    return Response.json(
+      { error: 'Webhook not configured: GITLAB_WEBHOOK_SECRET is not set' },
+      { status: 503 },
+    );
+  }
+
+  const token = req.headers.get('x-gitlab-token');
+  if (token === null || !tokensMatch(token, secret)) {
+    return Response.json({ error: 'Unauthorized' }, { status: 401 });
   }
 
   // Parse event type from header

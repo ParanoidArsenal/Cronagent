@@ -5,7 +5,7 @@ trigger: cron
 timeout: 300
 model: sonnet
 sandbox: false
-schedule: "*/20 * * * *"
+schedule: "0 9 * * 1-5"
 mcp:
   - jira
   - gitlab
@@ -15,7 +15,7 @@ notify:
 maxRetries: 2
 retryDelayMs: 10000
 maxTurns: 100
-preCollect: bash /app/scripts/collect-standup-data.sh 2>/dev/null || bash /app/scripts/collect-standup-data.sh 2>/dev/null
+preCollect: bash /app/scripts/collect-standup-data.sh
 systemPrompt: |
   Available MCP tools (do NOT use ToolSearch to discover them, call them directly):
   - mcp__jira__jira_search — JQL search

@@ -52,27 +52,7 @@ if [ -f "$CONF_FILE" ]; then
     AUTHOR_EMAIL="$_conf_email"
   fi
 
-  # Read REPOS array: lines between REPOS=( and )
-  _in_repos=false
-  REPOS=()
-  while IFS= read -r _line; do
-    _line="${_line%%#*}"          # strip comments
-    _line="${_line// /}"          # strip spaces for matching
-    if [[ "$_line" == "REPOS=(" ]]; then
-      _in_repos=true
-      continue
-    fi
-    if $_in_repos; then
-      if [[ "$_line" == ")" ]]; then
-        _in_repos=false
-        continue
-      fi
-      # Re-read the original line (with spaces) for the path
-      :
-    fi
-  done < "$CONF_FILE"
-
-  # Simpler approach: extract paths between REPOS=( and )
+  # Read REPOS array: paths between REPOS=( and )
   REPOS=()
   _in_repos=false
   while IFS= read -r _line; do

@@ -3,10 +3,9 @@
  * web/app/api/automations/[name]/route.ts.
  *
  * The handler is responsible for:
- *   1. Calling scheduler.stopOne() to halt any running cron job
- *   2. Calling setCronEnabled(name, false) to disable persisted state
- *   3. Proceeding with deletion even when the scheduler throws (e.g.
- *      web-only mode without a scheduler process)
+ *   1. Calling setCronEnabled(name, false) so the daemon (the sole cron
+ *      executor) stops firing it — the web process registers no crons
+ *   2. Proceeding with deletion even when setCronEnabled throws (DB down)
  *   4. Returning 404 when the automation does not exist
  *   5. Returning { deleted: true } on success
  *
@@ -45,10 +44,9 @@ const ROUTE_LINES = ROUTE_SOURCE.split('\n');
 describe('DELETE /api/automations/[name] — source structure', () => {
   // ── Imports ─────────────────────────────────────────────────────────────────
 
-  it('imports getScheduler from @/lib/backend', () => {
-    expect(ROUTE_SOURCE).toMatch(
-      /import\s*\{[^}]*getScheduler[^}]*\}\s*from\s*['"]@\/lib\/backend['"]/,
-    );
+  it('does not use an in-process scheduler (daemon owns cron)', () => {
+    expect(ROUTE_SOURCE).not.toContain('getScheduler');
+    expect(ROUTE_SOURCE).not.toContain('stopOne');
   });
 
   it('imports setCronEnabled from @/lib/backend', () => {
@@ -69,16 +67,6 @@ describe('DELETE /api/automations/[name] — source structure', () => {
     expect(ROUTE_SOURCE).toMatch(/export\s+async\s+function\s+DELETE\s*\(/);
   });
 
-  // ── scheduler.stopOne call ──────────────────────────────────────────────────
-
-  it('calls scheduler.stopOne', () => {
-    expect(ROUTE_SOURCE).toContain('scheduler.stopOne');
-  });
-
-  it('calls scheduler.stopOne with the decoded name', () => {
-    expect(ROUTE_SOURCE).toMatch(/scheduler\.stopOne\s*\(\s*decodedName\s*\)/);
-  });
-
   // ── setCronEnabled call ─────────────────────────────────────────────────────
 
   it('calls setCronEnabled', () => {
@@ -91,9 +79,9 @@ describe('DELETE /api/automations/[name] — source structure', () => {
 
   // ── try/catch wrapping ──────────────────────────────────────────────────────
 
-  it('wraps the scheduler block in try/catch', () => {
+  it('wraps the cron-disable block in try/catch', () => {
     // Both 'try' and 'catch' must appear before 'deleteAutomation' in the
-    // DELETE function body so that scheduler errors are swallowed.
+    // DELETE function body so that DB errors are swallowed.
     const deleteFnStart = ROUTE_LINES.findIndex((l) => l.includes('export async function DELETE'));
     expect(deleteFnStart).toBeGreaterThan(-1);
 
@@ -105,20 +93,8 @@ describe('DELETE /api/automations/[name] — source structure', () => {
     expect(tryIdx).toBeGreaterThan(-1);
     expect(catchIdx).toBeGreaterThan(tryIdx);
     // deleteAutomation must come AFTER the catch — meaning the try/catch
-    // wraps only the scheduler block, not the deletion itself.
+    // wraps only the cron-disable block, not the deletion itself.
     expect(deleteCallIdx).toBeGreaterThan(catchIdx);
-  });
-
-  it('stopOne is called inside the try block (before the catch)', () => {
-    const deleteFnStart = ROUTE_LINES.findIndex((l) => l.includes('export async function DELETE'));
-    const bodyLines = ROUTE_LINES.slice(deleteFnStart);
-
-    const tryIdx = bodyLines.findIndex((l) => /\btry\b/.test(l));
-    const catchIdx = bodyLines.findIndex((l) => /\bcatch\b/.test(l));
-    const stopOneIdx = bodyLines.findIndex((l) => l.includes('scheduler.stopOne'));
-
-    expect(stopOneIdx).toBeGreaterThan(tryIdx);
-    expect(stopOneIdx).toBeLessThan(catchIdx);
   });
 
   it('setCronEnabled is called inside the try block (before the catch)', () => {
@@ -133,15 +109,7 @@ describe('DELETE /api/automations/[name] — source structure', () => {
     expect(setCronIdx).toBeLessThan(catchIdx);
   });
 
-  // ── Ordering: stop before delete ────────────────────────────────────────────
-
-  it('calls stopOne before deleteAutomation', () => {
-    const stopOneIdx = ROUTE_SOURCE.indexOf('scheduler.stopOne');
-    const deleteCallIdx = ROUTE_SOURCE.indexOf('deleteAutomation(');
-    expect(stopOneIdx).toBeGreaterThan(-1);
-    expect(deleteCallIdx).toBeGreaterThan(-1);
-    expect(stopOneIdx).toBeLessThan(deleteCallIdx);
-  });
+  // ── Ordering: disable before delete ─────────────────────────────────────────
 
   it('calls setCronEnabled before deleteAutomation', () => {
     const setCronIdx = ROUTE_SOURCE.indexOf('setCronEnabled(');
@@ -171,8 +139,6 @@ describe('DELETE /api/automations/[name] — source structure', () => {
 
 // ── Mock @cronagent/* packages (resolved by vitest.config.ts aliases) ──
 
-const mockStopOne = vi.fn();
-const mockGetScheduler = vi.fn().mockResolvedValue({ stopOne: mockStopOne });
 const mockSetCronEnabled = vi.fn().mockResolvedValue(undefined);
 const mockDeleteAutomation = vi.fn();
 const mockGetAutomations = vi.fn();
@@ -201,7 +167,8 @@ vi.mock('@cronagent/notifier', () => ({
 }));
 
 vi.mock('@cronagent/scheduler', () => ({
-  Scheduler: vi.fn().mockImplementation(() => ({})),
+  CRON_ENABLED_PREFIX: 'cron_enabled::',
+  nextCronRun: vi.fn().mockReturnValue(null),
 }));
 
 vi.mock('@cronagent/skip-list', () => ({
@@ -229,7 +196,7 @@ vi.mock('js-yaml', () => ({
   default: { dump: vi.fn().mockReturnValue('name: test\n'), load: vi.fn() },
 }));
 
-// ── Intercept @/lib/backend so we can control getScheduler, etc. ─────────────
+// ── Intercept @/lib/backend so we can control setCronEnabled, etc. ───────────
 //
 // The route file imports from '@/lib/backend'. There is no '@/' alias in
 // vitest.config.ts, so Vitest resolves it via Next.js tsconfig path mapping.
@@ -237,12 +204,11 @@ vi.mock('js-yaml', () => ({
 
 vi.mock('../web/lib/backend.ts', async (importOriginal) => {
   // Pull in the real module so parseAutomationInput etc. still work if needed.
-  // For this test suite we only need to override the four functions the DELETE
+  // For this test suite we only need to override the three functions the DELETE
   // handler calls.
   const real = await importOriginal<typeof import('../web/lib/backend.ts')>();
   return {
     ...real,
-    getScheduler: (...args: unknown[]) => mockGetScheduler(...args),
     setCronEnabled: (...args: unknown[]) => mockSetCronEnabled(...args),
     deleteAutomation: (...args: unknown[]) => mockDeleteAutomation(...args),
     getAutomations: (...args: unknown[]) => mockGetAutomations(...args),
@@ -268,8 +234,6 @@ describe('DELETE /api/automations/[name] — functional', () => {
   beforeEach(() => {
     vi.clearAllMocks();
 
-    // Default: scheduler is healthy and returns a stub with stopOne
-    mockGetScheduler.mockResolvedValue({ stopOne: mockStopOne });
     mockSetCronEnabled.mockResolvedValue(undefined);
   });
 
@@ -292,24 +256,9 @@ describe('DELETE /api/automations/[name] — functional', () => {
       expect(res.status).toBe(200);
     });
 
-    it('calls scheduler.stopOne with the automation name', async () => {
-      await DELETE(fakeRequest, makeContext('my-job'));
-      expect(mockStopOne).toHaveBeenCalledWith('my-job');
-    });
-
     it('calls setCronEnabled(name, false)', async () => {
       await DELETE(fakeRequest, makeContext('my-job'));
       expect(mockSetCronEnabled).toHaveBeenCalledWith('my-job', false);
-    });
-
-    it('calls stopOne before deleteAutomation', async () => {
-      const callOrder: string[] = [];
-      mockStopOne.mockImplementation(() => { callOrder.push('stopOne'); });
-      mockDeleteAutomation.mockImplementation(() => { callOrder.push('deleteAutomation'); return Promise.resolve(true); });
-
-      await DELETE(fakeRequest, makeContext('my-job'));
-
-      expect(callOrder.indexOf('stopOne')).toBeLessThan(callOrder.indexOf('deleteAutomation'));
     });
 
     it('calls setCronEnabled before deleteAutomation', async () => {
@@ -324,7 +273,6 @@ describe('DELETE /api/automations/[name] — functional', () => {
 
     it('URL-decodes percent-encoded names before use', async () => {
       await DELETE(fakeRequest, makeContext('my job'));  // space becomes %20
-      expect(mockStopOne).toHaveBeenCalledWith('my job');
       expect(mockSetCronEnabled).toHaveBeenCalledWith('my job', false);
     });
   });
@@ -348,54 +296,10 @@ describe('DELETE /api/automations/[name] — functional', () => {
       expect(body).toHaveProperty('error');
     });
 
-    it('still attempts to stop the scheduler before checking existence', async () => {
+    it('still disables cron before checking existence', async () => {
       await DELETE(fakeRequest, makeContext('ghost-job'));
-      // Scheduler cleanup should always be attempted regardless of whether
-      // the file exists, because the cron job might still be registered.
-      expect(mockStopOne).toHaveBeenCalledTimes(1);
-    });
-  });
-
-  // ── Graceful fallback when scheduler throws ──────────────────────────────────
-
-  describe('when scheduler.getScheduler throws', () => {
-    beforeEach(() => {
-      mockGetScheduler.mockRejectedValue(new Error('Scheduler not initialized'));
-      mockDeleteAutomation.mockResolvedValue(true);
-    });
-
-    it('still returns { deleted: true } (scheduler error is swallowed)', async () => {
-      const res = await DELETE(fakeRequest, makeContext('my-job'));
-      const body = await res.json();
-      expect(body).toEqual({ deleted: true });
-    });
-
-    it('still returns HTTP 200', async () => {
-      const res = await DELETE(fakeRequest, makeContext('my-job'));
-      expect(res.status).toBe(200);
-    });
-
-    it('still calls deleteAutomation after the scheduler error', async () => {
-      await DELETE(fakeRequest, makeContext('my-job'));
-      expect(mockDeleteAutomation).toHaveBeenCalledWith('my-job');
-    });
-  });
-
-  describe('when scheduler.stopOne throws', () => {
-    beforeEach(() => {
-      mockStopOne.mockImplementation(() => { throw new Error('stopOne failed'); });
-      mockDeleteAutomation.mockResolvedValue(true);
-    });
-
-    it('still returns { deleted: true }', async () => {
-      const res = await DELETE(fakeRequest, makeContext('my-job'));
-      const body = await res.json();
-      expect(body).toEqual({ deleted: true });
-    });
-
-    it('still calls deleteAutomation', async () => {
-      await DELETE(fakeRequest, makeContext('my-job'));
-      expect(mockDeleteAutomation).toHaveBeenCalledWith('my-job');
+      // The flag may outlive the file, so it is always cleared.
+      expect(mockSetCronEnabled).toHaveBeenCalledWith('ghost-job', false);
     });
   });
 

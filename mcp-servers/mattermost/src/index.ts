@@ -23,6 +23,88 @@ if (!MM_URL || !MM_TOKEN) {
   process.exit(1);
 }
 
+const HTTP_TIMEOUT_MS = (() => {
+  const n = Number(process.env.MCP_HTTP_TIMEOUT_MS);
+  return Number.isFinite(n) && n > 0 ? n : 30_000;
+})();
+
+function isTimeoutError(err: unknown): boolean {
+  return (
+    err instanceof Error &&
+    (err.name === "TimeoutError" || err.name === "AbortError")
+  );
+}
+
+// ==================== Argument validation ====================
+
+class ToolArgError extends Error {}
+
+/**
+ * Lightweight runtime check of tool arguments against the tool's own
+ * inputSchema (required fields + top-level primitive types + enum).
+ * Numeric strings are coerced for "number" fields and numbers for "string"
+ * fields. Throws ToolArgError.
+ */
+function validateArgs(
+  schema: { properties?: Record<string, any>; required?: string[] },
+  rawArgs: unknown
+): Record<string, any> {
+  if (rawArgs != null && (typeof rawArgs !== "object" || Array.isArray(rawArgs))) {
+    throw new ToolArgError("arguments must be an object");
+  }
+  const args: Record<string, any> = { ...((rawArgs as Record<string, any>) ?? {}) };
+  const props = schema.properties ?? {};
+  for (const key of schema.required ?? []) {
+    const v = args[key];
+    if (v === undefined || v === null || (typeof v === "string" && v.trim() === "")) {
+      throw new ToolArgError(`missing required argument '${key}'`);
+    }
+  }
+  for (const [key, def] of Object.entries(props)) {
+    const v = args[key];
+    if (v === undefined || v === null) continue;
+    const expected = def?.type;
+    let ok = true;
+    switch (expected) {
+      case "string":
+        if (typeof v === "number" && Number.isFinite(v)) args[key] = String(v);
+        ok = typeof args[key] === "string";
+        break;
+      case "number":
+      case "integer":
+        if (typeof v === "string" && v.trim() !== "" && Number.isFinite(Number(v))) {
+          args[key] = Number(v);
+        }
+        ok = typeof args[key] === "number" && Number.isFinite(args[key]) &&
+          (expected !== "integer" || Number.isInteger(args[key]));
+        break;
+      case "boolean":
+        ok = typeof v === "boolean";
+        break;
+      case "array":
+        ok = Array.isArray(v);
+        break;
+      case "object":
+        ok = typeof v === "object" && !Array.isArray(v);
+        break;
+    }
+    if (!ok) {
+      throw new ToolArgError(
+        `argument '${key}' must be of type ${expected}, got ${Array.isArray(v) ? "array" : typeof v}`
+      );
+    }
+    if (Array.isArray(def?.enum) && !def.enum.includes(args[key])) {
+      throw new ToolArgError(
+        `argument '${key}' must be one of: ${def.enum.join(", ")}`
+      );
+    }
+  }
+  return args;
+}
+
+/** Encode an LLM-supplied value for use as a single URL path segment. */
+const seg = (v: string | number) => encodeURIComponent(String(v));
+
 // --- Merge notification constants & helpers ---
 
 const STEPS = [
@@ -141,35 +223,43 @@ async function callCailaLLM(description: string): Promise<string> {
     throw new Error("CAILA_API_KEY not configured");
   }
 
-  const url = `${CAILA_BASE_URL}/api/adapters/openai-direct/chat/completions`;
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${CAILA_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: "your-org/model-id",
-      messages: [
-        {
-          role: "system",
-          content:
-            "Ты пишешь краткие описания задач для уведомлений. На входе — контекст задачи (описание, треды Mattermost, метаданные). Напиши 1-3 предложения, передающих суть задачи. Пиши на том же языке что и контекст. Не включай технические детали (ID аккаунтов, окружение, ключ задачи). Верни только текст описания, без маркдауна и кавычек.",
-        },
-        { role: "user", content: description },
-      ],
-      max_tokens: 500,
-      temperature: 0.1,
-    }),
-  });
+  try {
+    const url = `${CAILA_BASE_URL}/api/adapters/openai-direct/chat/completions`;
+    const res = await fetch(url, {
+      method: "POST",
+      signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
+      headers: {
+        Authorization: `Bearer ${CAILA_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "your-org/model-id",
+        messages: [
+          {
+            role: "system",
+            content:
+              "Ты пишешь краткие описания задач для уведомлений. На входе — контекст задачи (описание, треды Mattermost, метаданные). Напиши 1-3 предложения, передающих суть задачи. Пиши на том же языке что и контекст. Не включай технические детали (ID аккаунтов, окружение, ключ задачи). Верни только текст описания, без маркдауна и кавычек.",
+          },
+          { role: "user", content: description },
+        ],
+        max_tokens: 500,
+        temperature: 0.1,
+      }),
+    });
 
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Caila LLM error: ${res.status} ${text}`);
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`Caila LLM error: ${res.status} ${text}`);
+    }
+
+    const data = await res.json();
+    return data.choices?.[0]?.message?.content?.trim() || "";
+  } catch (err) {
+    if (isTimeoutError(err)) {
+      throw new Error(`Caila LLM request timed out after ${HTTP_TIMEOUT_MS}ms (set MCP_HTTP_TIMEOUT_MS to change)`);
+    }
+    throw err;
   }
-
-  const data = await res.json();
-  return data.choices?.[0]?.message?.content?.trim() || "";
 }
 
 /** Summarize description: try LLM, fallback to truncation */
@@ -275,7 +365,7 @@ async function ensureChannelMembership(channelId: string): Promise<void> {
 
   const userId = await getBotUserId();
   try {
-    await mmRequest(`/channels/${channelId}/members`, "POST", {
+    await mmRequest(`/channels/${seg(channelId)}/members`, "POST", {
       user_id: userId,
     });
     console.error(`[MattermostMCP] Joined channel ${channelId}`);
@@ -302,6 +392,7 @@ async function registerThreadSession(
     const currentSessionId = process.env.CURRENT_SESSION_ID || null;
     const res = await fetch(`${AGENT_RUNNER_URL}/api/mattermost/sessions`, {
       method: "POST",
+      signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         thread_id: threadId,
@@ -322,7 +413,10 @@ async function registerThreadSession(
       console.error(`[MattermostMCP] Failed to register session: ${res.status} ${text}`);
     }
   } catch (e: any) {
-    console.error(`[MattermostMCP] Session registration error: ${e.message}`);
+    const msg = isTimeoutError(e)
+      ? `request timed out after ${HTTP_TIMEOUT_MS}ms`
+      : e.message;
+    console.error(`[MattermostMCP] Session registration error: ${msg}`);
   }
 }
 
@@ -382,14 +476,25 @@ async function mmRequest<T>(
     options.body = JSON.stringify(body);
   }
 
-  const response = await fetch(`${MM_URL}/api/v4${endpoint}`, options);
+  options.signal = AbortSignal.timeout(HTTP_TIMEOUT_MS);
 
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`Mattermost API error: ${response.status} ${response.statusText} - ${text}`);
+  try {
+    const response = await fetch(`${MM_URL}/api/v4${endpoint}`, options);
+
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`Mattermost API error: ${response.status} ${response.statusText} - ${text}`);
+    }
+
+    return (await response.json()) as T;
+  } catch (err) {
+    if (isTimeoutError(err)) {
+      throw new Error(
+        `Mattermost API ${method} ${endpoint}: request timed out after ${HTTP_TIMEOUT_MS}ms (set MCP_HTTP_TIMEOUT_MS to change)`
+      );
+    }
+    throw err;
   }
-
-  return response.json();
 }
 
 const server = new Server(
@@ -404,8 +509,7 @@ const server = new Server(
   }
 );
 
-server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: [
+const TOOLS = [
     {
       name: "send_message",
       description: "Send a message to a Mattermost channel. Can optionally reply to a thread. Use subscribe_as to auto-monitor the thread for replies.",
@@ -717,13 +821,33 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ["progress_post_id"],
       },
     },
-  ],
+];
+
+server.setRequestHandler(ListToolsRequestSchema, async () => ({
+  tools: TOOLS,
 }));
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args } = request.params;
+  const { name, arguments: rawArgs } = request.params;
 
   try {
+    const tool = TOOLS.find((t) => t.name === name);
+    let args: Record<string, any> | undefined = rawArgs;
+    if (tool) {
+      try {
+        args = validateArgs(tool.inputSchema, rawArgs);
+      } catch (err) {
+        if (err instanceof ToolArgError) {
+          return {
+            content: [
+              { type: "text", text: `Invalid arguments for ${name}: ${err.message}` },
+            ],
+            isError: true,
+          };
+        }
+        throw err;
+      }
+    }
     switch (name) {
       case "send_message": {
         const { channel_id, message, root_id, subscribe_as } = args as {
@@ -763,7 +887,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
 
         const result = await mmRequest<PostsResponse>(
-          `/channels/${channel_id}/posts?per_page=${per_page}`
+          `/channels/${seg(channel_id)}/posts?per_page=${encodeURIComponent(String(per_page))}`
         );
 
         if (!result.posts || Object.keys(result.posts).length === 0) {
@@ -793,7 +917,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "get_thread": {
         const { post_id } = args as { post_id: string };
 
-        const result = await mmRequest<PostsResponse>(`/posts/${post_id}/thread`);
+        const result = await mmRequest<PostsResponse>(`/posts/${seg(post_id)}/thread`);
 
         if (!result.posts || Object.keys(result.posts).length === 0) {
           return {
@@ -851,9 +975,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         let user: User;
         if (user_id) {
-          user = await mmRequest<User>(`/users/${user_id}`);
+          user = await mmRequest<User>(`/users/${seg(user_id)}`);
         } else if (username) {
-          user = await mmRequest<User>(`/users/username/${username}`);
+          user = await mmRequest<User>(`/users/username/${seg(username)}`);
         } else {
           return {
             content: [{ type: "text", text: "Either user_id or username is required" }],
@@ -874,7 +998,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "get_channel": {
         const { channel_id } = args as { channel_id: string };
 
-        const channel = await mmRequest<Channel>(`/channels/${channel_id}`);
+        const channel = await mmRequest<Channel>(`/channels/${seg(channel_id)}`);
 
         return {
           content: [
@@ -893,7 +1017,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
 
         const result = await mmRequest<PostsResponse>(
-          `/teams/${team_id}/posts/search`,
+          `/teams/${seg(team_id)}/posts/search`,
           "POST",
           { terms }
         );
@@ -941,7 +1065,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           message: string;
         };
 
-        const post = await mmRequest<Post>(`/posts/${post_id}`, "PUT", {
+        const post = await mmRequest<Post>(`/posts/${seg(post_id)}`, "PUT", {
           id: post_id,
           message,
         });
@@ -959,7 +1083,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "delete_post": {
         const { post_id } = args as { post_id: string };
 
-        await mmRequest(`/posts/${post_id}`, "DELETE");
+        await mmRequest(`/posts/${seg(post_id)}`, "DELETE");
 
         return {
           content: [
@@ -1078,11 +1202,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
 
         // Get current post text
-        const currentPost = await mmRequest<Post>(`/posts/${post_id}`);
+        const currentPost = await mmRequest<Post>(`/posts/${seg(post_id)}`);
         const updatedMessage = currentPost.message.replace(/:loading1:/g, emoji);
 
         // Update post
-        await mmRequest<Post>(`/posts/${post_id}`, "PUT", {
+        await mmRequest<Post>(`/posts/${seg(post_id)}`, "PUT", {
           id: post_id,
           message: updatedMessage,
         });
@@ -1152,7 +1276,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         let state = loadProgressState(progress_post_id);
         if (!state) {
           // Fallback: read post from MM and parse table
-          const post = await mmRequest<Post>(`/posts/${progress_post_id}`);
+          const post = await mmRequest<Post>(`/posts/${seg(progress_post_id)}`);
           const parsed = parseProgressTable(post.message);
           if (parsed) {
             state = {
@@ -1228,7 +1352,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         // Render and update
         const tableMessage = renderProgressTable(state.steps);
-        await mmRequest<Post>(`/posts/${progress_post_id}`, "PUT", {
+        await mmRequest<Post>(`/posts/${seg(progress_post_id)}`, "PUT", {
           id: progress_post_id,
           message: tableMessage,
         });

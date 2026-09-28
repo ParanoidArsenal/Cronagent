@@ -99,6 +99,88 @@ interface JiraSearchResults {
   startAt: number;
 }
 
+const HTTP_TIMEOUT_MS = (() => {
+  const n = Number(process.env.MCP_HTTP_TIMEOUT_MS);
+  return Number.isFinite(n) && n > 0 ? n : 30_000;
+})();
+
+function isTimeoutError(err: unknown): boolean {
+  return (
+    err instanceof Error &&
+    (err.name === "TimeoutError" || err.name === "AbortError")
+  );
+}
+
+// ==================== Argument validation ====================
+
+class ToolArgError extends Error {}
+
+/**
+ * Lightweight runtime check of tool arguments against the tool's own
+ * inputSchema (required fields + top-level primitive types + enum).
+ * Numeric strings are coerced for "number" fields and numbers for "string"
+ * fields. Throws ToolArgError.
+ */
+function validateArgs(
+  schema: { properties?: Record<string, any>; required?: string[] },
+  rawArgs: unknown
+): Record<string, any> {
+  if (rawArgs != null && (typeof rawArgs !== "object" || Array.isArray(rawArgs))) {
+    throw new ToolArgError("arguments must be an object");
+  }
+  const args: Record<string, any> = { ...((rawArgs as Record<string, any>) ?? {}) };
+  const props = schema.properties ?? {};
+  for (const key of schema.required ?? []) {
+    const v = args[key];
+    if (v === undefined || v === null || (typeof v === "string" && v.trim() === "")) {
+      throw new ToolArgError(`missing required argument '${key}'`);
+    }
+  }
+  for (const [key, def] of Object.entries(props)) {
+    const v = args[key];
+    if (v === undefined || v === null) continue;
+    const expected = def?.type;
+    let ok = true;
+    switch (expected) {
+      case "string":
+        if (typeof v === "number" && Number.isFinite(v)) args[key] = String(v);
+        ok = typeof args[key] === "string";
+        break;
+      case "number":
+      case "integer":
+        if (typeof v === "string" && v.trim() !== "" && Number.isFinite(Number(v))) {
+          args[key] = Number(v);
+        }
+        ok = typeof args[key] === "number" && Number.isFinite(args[key]) &&
+          (expected !== "integer" || Number.isInteger(args[key]));
+        break;
+      case "boolean":
+        ok = typeof v === "boolean";
+        break;
+      case "array":
+        ok = Array.isArray(v);
+        break;
+      case "object":
+        ok = typeof v === "object" && !Array.isArray(v);
+        break;
+    }
+    if (!ok) {
+      throw new ToolArgError(
+        `argument '${key}' must be of type ${expected}, got ${Array.isArray(v) ? "array" : typeof v}`
+      );
+    }
+    if (Array.isArray(def?.enum) && !def.enum.includes(args[key])) {
+      throw new ToolArgError(
+        `argument '${key}' must be one of: ${def.enum.join(", ")}`
+      );
+    }
+  }
+  return args;
+}
+
+/** Encode an LLM-supplied value for use as a single URL path segment. */
+const seg = (v: string | number) => encodeURIComponent(String(v));
+
 // HTTP request helper
 async function jiraRequest<T>(
   endpoint: string,
@@ -122,18 +204,29 @@ async function jiraRequest<T>(
     options.body = JSON.stringify(body);
   }
 
-  const response = await fetch(url, options);
+  options.signal = AbortSignal.timeout(HTTP_TIMEOUT_MS);
 
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`Jira API error ${response.status}: ${errorText}`);
-  }
+  try {
+    const response = await fetch(url, options);
 
-  const contentType = response.headers.get("content-type");
-  if (contentType && contentType.includes("application/json")) {
-    return response.json() as Promise<T>;
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Jira API error ${response.status}: ${errorText}`);
+    }
+
+    const contentType = response.headers.get("content-type");
+    if (contentType && contentType.includes("application/json")) {
+      return (await response.json()) as T;
+    }
+    return {} as T;
+  } catch (err) {
+    if (isTimeoutError(err)) {
+      throw new Error(
+        `Jira API ${method} ${endpoint}: request timed out after ${HTTP_TIMEOUT_MS}ms (set MCP_HTTP_TIMEOUT_MS to change)`
+      );
+    }
+    throw err;
   }
-  return {} as T;
 }
 
 // Download attachment using JSESSIONID cookie
@@ -153,6 +246,7 @@ async function downloadAttachment(
       headers: {
         Cookie: `JSESSIONID=${CONFIG.jsessionId}`,
       },
+      signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
     });
 
     if (!response.ok) {
@@ -183,6 +277,12 @@ async function downloadAttachment(
 
     return { success: true, path: outputPath };
   } catch (error) {
+    if (isTimeoutError(error)) {
+      return {
+        success: false,
+        error: `Attachment download timed out after ${HTTP_TIMEOUT_MS}ms (set MCP_HTTP_TIMEOUT_MS to change)`,
+      };
+    }
     return {
       success: false,
       error: error instanceof Error ? error.message : String(error),
@@ -268,8 +368,7 @@ const server = new Server(
   }
 );
 
-server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: [
+const TOOLS = [
     {
       name: "jira_get_issue_full",
       description:
@@ -547,13 +646,33 @@ To get JSESSIONID:
         required: ["project_key", "summary", "issuetype"],
       },
     },
-  ],
+];
+
+server.setRequestHandler(ListToolsRequestSchema, async () => ({
+  tools: TOOLS,
 }));
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args } = request.params;
+  const { name, arguments: rawArgs } = request.params;
 
   try {
+    const tool = TOOLS.find((t) => t.name === name);
+    let args: Record<string, any> | undefined = rawArgs;
+    if (tool) {
+      try {
+        args = validateArgs(tool.inputSchema, rawArgs);
+      } catch (err) {
+        if (err instanceof ToolArgError) {
+          return {
+            content: [
+              { type: "text", text: `Invalid arguments for ${name}: ${err.message}` },
+            ],
+            isError: true,
+          };
+        }
+        throw err;
+      }
+    }
     switch (name) {
       case "jira_get_issue_full": {
         const {
@@ -570,7 +689,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         // Fetch issue with all relevant fields in one call
         const issue = await jiraRequest<JiraIssue>(
-          `/issue/${issue_key}?fields=summary,description,issuetype,status,priority,` +
+          `/issue/${seg(issue_key)}?fields=summary,description,issuetype,status,priority,` +
             `assignee,reporter,creator,components,labels,fixVersions,versions,` +
             `issuelinks,subtasks,parent,comment,attachment,resolution,created,updated,resolutiondate`
         );
@@ -621,7 +740,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (parentRef) {
           try {
             const parent = await jiraRequest<JiraIssue>(
-              `/issue/${parentRef.key}?fields=summary,description,status,issuetype,priority`
+              `/issue/${seg(parentRef.key)}?fields=summary,description,status,issuetype,priority`
             );
             result.parent = {
               key: parent.key,
@@ -676,7 +795,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           if (include_linked_descriptions && linkedIssue?.key) {
             try {
               const full = await jiraRequest<JiraIssue>(
-                `/issue/${linkedIssue.key}?fields=description`
+                `/issue/${seg(linkedIssue.key)}?fields=description`
               );
               entry.description = full.fields.description || null;
             } catch {
@@ -728,7 +847,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "jira_get_issue": {
         const { issue_key } = args as { issue_key: string };
         const issue = await jiraRequest<JiraIssue>(
-          `/issue/${issue_key}?expand=renderedFields`
+          `/issue/${seg(issue_key)}?expand=renderedFields`
         );
         return {
           content: [{ type: "text", text: formatIssue(issue) }],
@@ -738,7 +857,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "jira_get_issue_raw": {
         const { issue_key } = args as { issue_key: string };
         const issue = await jiraRequest<JiraIssue>(
-          `/issue/${issue_key}?expand=renderedFields`
+          `/issue/${seg(issue_key)}?expand=renderedFields`
         );
         return {
           content: [{ type: "text", text: JSON.stringify(issue, null, 2) }],
@@ -802,7 +921,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "jira_get_comments": {
         const { issue_key } = args as { issue_key: string };
         const response = await jiraRequest<{ comments: JiraComment[] }>(
-          `/issue/${issue_key}/comment`
+          `/issue/${seg(issue_key)}/comment`
         );
 
         if (response.comments.length === 0) {
@@ -829,7 +948,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           issue_key: string;
           comment: string;
         };
-        await jiraRequest(`/issue/${issue_key}/comment`, "POST", {
+        await jiraRequest(`/issue/${seg(issue_key)}/comment`, "POST", {
           body: comment,
         });
         return {
@@ -845,7 +964,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "jira_list_attachments": {
         const { issue_key } = args as { issue_key: string };
         const issue = await jiraRequest<JiraIssue>(
-          `/issue/${issue_key}?fields=attachment,description`
+          `/issue/${seg(issue_key)}?fields=attachment,description`
         );
 
         const attachments = issue.fields.attachment || [];
@@ -900,7 +1019,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
 
         const issue = await jiraRequest<JiraIssue>(
-          `/issue/${issue_key}?fields=attachment`
+          `/issue/${seg(issue_key)}?fields=attachment`
         );
         const attachments = issue.fields.attachment || [];
         const attachment = attachments.find((a) => a.filename === filename);
@@ -951,7 +1070,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
 
         const issue = await jiraRequest<JiraIssue>(
-          `/issue/${issue_key}?fields=attachment`
+          `/issue/${seg(issue_key)}?fields=attachment`
         );
         let attachments = issue.fields.attachment || [];
 
@@ -1018,7 +1137,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const { issue_key } = args as { issue_key: string };
         const response = await jiraRequest<{
           transitions: Array<{ id: string; name: string; to: { name: string } }>;
-        }>(`/issue/${issue_key}/transitions`);
+        }>(`/issue/${seg(issue_key)}/transitions`);
 
         const lines = [
           `# Available Transitions for ${issue_key}`,
@@ -1053,7 +1172,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           };
         }
 
-        await jiraRequest(`/issue/${issue_key}/transitions`, "POST", body);
+        await jiraRequest(`/issue/${seg(issue_key)}/transitions`, "POST", body);
 
         return {
           content: [
@@ -1068,7 +1187,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "jira_get_linked_issues": {
         const { issue_key } = args as { issue_key: string };
         const issue = await jiraRequest<JiraIssue>(
-          `/issue/${issue_key}?fields=issuelinks`
+          `/issue/${seg(issue_key)}?fields=issuelinks`
         );
 
         const links = issue.fields.issuelinks || [];

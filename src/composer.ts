@@ -30,7 +30,7 @@ export class Composer {
   /**
    * Execute a composed automation — run each referenced automation in sequence.
    */
-  async execute(automation: Automation, extraEnv?: Record<string, string>): Promise<ExecutionResult> {
+  async execute(automation: Automation, extraEnv?: Record<string, string>, signal?: AbortSignal): Promise<ExecutionResult> {
     const startedAt = new Date();
     let composeDef: { compose: string[]; on_complete?: Record<string, string> };
 
@@ -51,8 +51,18 @@ export class Composer {
 
     const outputs: string[] = [];
     let allSuccess = true;
+    let error: string | undefined;
+    // Sum spend across steps so composed runs count toward the daily budget.
+    let costUsd: number | undefined;
+    let inputTokens: number | undefined;
+    let outputTokens: number | undefined;
 
     for (const stepName of composeDef.compose) {
+      if (signal?.aborted) {
+        allSuccess = false;
+        error = 'Run stopped by user';
+        break;
+      }
       const step = this.automationMap.get(stepName);
       if (!step) {
         outputs.push(`[SKIP] ${stepName}: not found`);
@@ -63,7 +73,10 @@ export class Composer {
 
       logger.info({ composed: automation.name, step: stepName }, 'Running composed step');
 
-      const result = await this.runner.execute(step, extraEnv);
+      const result = await this.runner.execute(step, extraEnv, undefined, undefined, signal);
+      if (result.costUsd !== undefined) costUsd = (costUsd ?? 0) + result.costUsd;
+      if (result.inputTokens !== undefined) inputTokens = (inputTokens ?? 0) + result.inputTokens;
+      if (result.outputTokens !== undefined) outputTokens = (outputTokens ?? 0) + result.outputTokens;
       outputs.push(`--- ${stepName} (${result.success ? 'OK' : 'FAIL'}) ---`);
       outputs.push(result.output || result.error || '(no output)');
 
@@ -79,10 +92,14 @@ export class Composer {
       automationName: automation.name,
       success: allSuccess,
       output: summary,
+      error,
       durationMs: Date.now() - startedAt.getTime(),
       startedAt,
       finishedAt: new Date(),
       mode: 'composed',
+      costUsd,
+      inputTokens,
+      outputTokens,
     };
 
     // Send webhook notification

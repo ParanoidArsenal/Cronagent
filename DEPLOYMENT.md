@@ -33,6 +33,7 @@ You can deploy with an empty `.env` file (or just copy `.env.example` as-is).
 | `AUTOMATIONS_DIR` | `/app/automations`           | Dockerfile       |
 | `MCP_CONFIG`      | `/app/mcp.json`              | Dockerfile       |
 | `SANDBOX_IMAGE`   | `cronagent-sandbox`    | docker-compose   |
+| `SANDBOX_NETWORK` | `bridge`               | runner default   |
 | `PORT`            | `3000`                       | Dockerfile       |
 | `HOSTNAME`        | `0.0.0.0`                    | Dockerfile       |
 | `LOG_LEVEL`       | `info`                       | Optional         |

@@ -9,7 +9,7 @@ import { History, DEFAULT_THROTTLE } from '@cronagent/history';
 import type { ThrottleConfig } from '@cronagent/history';
 import { Composer } from '@cronagent/composer';
 import { Notifier } from '@cronagent/notifier';
-import { Scheduler } from '@cronagent/scheduler';
+import { CRON_ENABLED_PREFIX, nextCronRun } from '@cronagent/scheduler';
 import { SkipList } from '@cronagent/skip-list';
 import { UsageTracker } from '@cronagent/usage-tracker';
 import type { Automation, ExecutionResult, ConversationContext, NotifyConfig } from '@cronagent/types';
@@ -32,7 +32,6 @@ const g = globalThis as typeof globalThis & {
   __runner?: Runner;
   __historyPromise?: Promise<History>;
   __automationsCache?: { automations: Automation[]; loadedAt: number };
-  __schedulerPromise?: Promise<Scheduler>;
   __notifier?: Notifier;
 };
 
@@ -440,8 +439,9 @@ export async function getUsageTracker(): Promise<UsageTracker> {
 }
 
 // ── Cron Scheduler ───────────────────────────────────────────
-
-const CRON_ENABLED_PREFIX = 'cron_enabled::';
+//
+// The daemon is the sole cron executor. The web only flips the per-automation
+// `cron_enabled::<name>` flag; the daemon reads it on every tick.
 
 export async function getCronEnabled(name: string): Promise<boolean> {
   const history = await getHistory();
@@ -466,33 +466,6 @@ export async function getAllCronEnabled(): Promise<Record<string, boolean>> {
   return result;
 }
 
-export async function getScheduler(): Promise<Scheduler> {
-  if (!g.__schedulerPromise) {
-    g.__schedulerPromise = (async () => {
-      const runner = await getRunner();
-      const history = await getHistory();
-      const skipList = new SkipList(history);
-      await skipList.prePopulate();
-      const notifier = await getNotifier();
-      const scheduler = new Scheduler(runner, history, skipList, notifier);
-
-      // Load all automations so the scheduler has them for composed lookups
-      const automations = await getAutomations();
-      scheduler.setAutomations(automations);
-
-      // NOTE: cron jobs are NOT registered here — the daemon container is the
-      // sole cron executor.  The web scheduler instance is used only for
-      // status queries and start/stop toggle operations.
-
-      return scheduler;
-    })().catch((err) => {
-      g.__schedulerPromise = undefined;
-      throw err;
-    });
-  }
-  return g.__schedulerPromise;
-}
-
 export interface SchedulerJobStatus {
   name: string;
   schedule: string | undefined;
@@ -502,28 +475,23 @@ export interface SchedulerJobStatus {
 }
 
 export async function getSchedulerStatus(): Promise<SchedulerJobStatus[]> {
-  const scheduler = await getScheduler();
-  const activeJobs = scheduler.getStatus();
+  const history = await getHistory();
   const automations = await getAutomations();
   const cronAutomations = automations.filter((a) => a.trigger === 'cron' && a.schedule);
 
-  const activeMap = new Map(activeJobs.map((j) => [j.name, j]));
+  // Batch-read enabled flags and running state (from the DB — runs may belong to the daemon)
+  const [enabledFlags, runningCounts] = await Promise.all([
+    Promise.all(cronAutomations.map((a) => getCronEnabled(a.name))),
+    Promise.all(cronAutomations.map((a) => history.getRunningCountDb(a.name))),
+  ]);
 
-  // Batch-read all enabled flags in parallel
-  const enabledFlags = await Promise.all(
-    cronAutomations.map((a) => getCronEnabled(a.name)),
-  );
-
-  return cronAutomations.map((a, i) => {
-    const active = activeMap.get(a.name);
-    return {
-      name: a.name,
-      schedule: a.schedule ?? undefined,
-      nextRun: active?.nextRun ?? null,
-      running: active?.running ?? false,
-      enabled: enabledFlags[i],
-    };
-  });
+  return cronAutomations.map((a, i) => ({
+    name: a.name,
+    schedule: a.schedule ?? undefined,
+    nextRun: enabledFlags[i] && a.schedule ? nextCronRun(a.schedule) : null,
+    running: runningCounts[i] > 0,
+    enabled: enabledFlags[i],
+  }));
 }
 
 // ── Track in-flight runs ─────────────────────────────────────
@@ -672,7 +640,7 @@ export async function triggerRun(name: string, opts?: { newConversation?: boolea
   (async () => {
     let result: ExecutionResult;
     if (isComposedAutomation(automation.instructions)) {
-      result = await (await getComposer(automations)).execute(automation, extraEnv);
+      result = await (await getComposer(automations)).execute(automation, extraEnv, abortController.signal);
     } else {
       result = await runner.execute(automation, extraEnv, conversationCtx, onProgress, abortController.signal, onLogFile);
     }

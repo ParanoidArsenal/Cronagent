@@ -148,7 +148,7 @@ describe('Composer', () => {
     expect(result.success).toBe(false);
     // step-b must never have been called
     expect(runner.execute).toHaveBeenCalledTimes(1);
-    expect(runner.execute).toHaveBeenCalledWith(stepA, undefined);
+    expect(runner.execute).toHaveBeenCalledWith(stepA, undefined, undefined, undefined, undefined);
   });
 
   // 4. Unknown step name → skip and fail
@@ -190,7 +190,49 @@ describe('Composer', () => {
 
     await composer.execute(automation, extraEnv);
 
-    expect(runner.execute).toHaveBeenCalledWith(stepA, extraEnv);
+    expect(runner.execute).toHaveBeenCalledWith(stepA, extraEnv, undefined, undefined, undefined);
+  });
+
+  it('sums cost and tokens across steps', async () => {
+    const stepA = makeStepAutomation('step-a');
+    const stepB = makeStepAutomation('step-b');
+    const composer = new Composer(runner as unknown as Runner, [stepA, stepB], notifier as unknown as Notifier);
+
+    (runner.execute as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce(makeExecutionResult({ costUsd: 0.1, inputTokens: 10, outputTokens: 1 }))
+      .mockResolvedValueOnce(makeExecutionResult({ success: false, costUsd: 0.2, inputTokens: 20, outputTokens: 2 }));
+
+    const result = await composer.execute(makeAutomation({
+      instructions: JSON.stringify({ compose: ['step-a', 'step-b'] }),
+    }));
+
+    expect(result.success).toBe(false);
+    expect(result.costUsd).toBeCloseTo(0.3);
+    expect(result.inputTokens).toBe(30);
+    expect(result.outputTokens).toBe(3);
+  });
+
+  it('forwards the abort signal to steps and stops before the next step once aborted', async () => {
+    const stepA = makeStepAutomation('step-a');
+    const stepB = makeStepAutomation('step-b');
+    const composer = new Composer(runner as unknown as Runner, [stepA, stepB], notifier as unknown as Notifier);
+    const controller = new AbortController();
+
+    (runner.execute as ReturnType<typeof vi.fn>).mockImplementationOnce(async () => {
+      controller.abort();
+      return makeExecutionResult();
+    });
+
+    const result = await composer.execute(
+      makeAutomation({ instructions: JSON.stringify({ compose: ['step-a', 'step-b'] }) }),
+      undefined,
+      controller.signal,
+    );
+
+    expect(runner.execute).toHaveBeenCalledTimes(1);
+    expect(runner.execute).toHaveBeenCalledWith(stepA, undefined, undefined, undefined, controller.signal);
+    expect(result.success).toBe(false);
+    expect(result.error).toBe('Run stopped by user');
   });
 
   // 6. notifier.notify is called with the composed result

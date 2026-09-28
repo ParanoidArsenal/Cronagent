@@ -38,7 +38,11 @@
       ],
       "env": {
         "MATTERMOST_URL": "${MATTERMOST_URL}",
-        "MATTERMOST_TOKEN": "${MATTERMOST_TOKEN}"
+        "MATTERMOST_TOKEN": "${MATTERMOST_TOKEN}",
+        "CAILA_API_KEY": "${CAILA_API_KEY}",
+        "CAILA_BASE_URL": "${CAILA_BASE_URL}",
+        "JIRA_URL": "${JIRA_URL}",
+        "AGENT_RUNNER_URL": "${AGENT_RUNNER_URL}"
       }
     }
   }

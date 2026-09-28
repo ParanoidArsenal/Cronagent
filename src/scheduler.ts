@@ -10,6 +10,33 @@ import type { Notifier } from './notifier.js';
 import type { Automation, ConversationContext } from './types.js';
 import { randomUUID } from 'node:crypto';
 
+/** Settings key prefix for the per-automation cron on/off flag toggled from the web UI. */
+export const CRON_ENABLED_PREFIX = 'cron_enabled::';
+
+/** A cron automation runs only when its flag is explicitly `true` (unset = disabled). */
+export async function isCronEnabled(history: History, name: string): Promise<boolean> {
+  const val = await history.getSetting<boolean>(`${CRON_ENABLED_PREFIX}${name}`);
+  return val === true;
+}
+
+/** Next fire time of a cron pattern without scheduling anything; null if invalid or none. */
+export function nextCronRun(schedule: string): string | null {
+  try {
+    return new Cron(schedule).nextRun()?.toISOString() ?? null;
+  } catch {
+    return null;
+  }
+}
+
+export interface SchedulerOptions {
+  /**
+   * Check the `cron_enabled::<name>` setting on every tick and skip disabled
+   * automations. The daemon sets this so start/stop in the web UI (which only
+   * flips the flag) takes effect without a restart.
+   */
+  honorCronFlags?: boolean;
+}
+
 export class Scheduler {
   private crons: Map<string, Cron> = new Map();
   private runner: Runner;
@@ -21,13 +48,15 @@ export class Scheduler {
   private skipList?: SkipList;
   private notifier?: Notifier;
   private shuttingDown = false;
+  private honorCronFlags: boolean;
 
-  constructor(runner: Runner, history: History, skipList?: SkipList, notifier?: Notifier) {
+  constructor(runner: Runner, history: History, skipList?: SkipList, notifier?: Notifier, opts?: SchedulerOptions) {
     this.runner = runner;
     this.history = history;
     this.usageTracker = new UsageTracker(history);
     this.skipList = skipList;
     this.notifier = notifier;
+    this.honorCronFlags = opts?.honorCronFlags ?? false;
   }
 
   /**
@@ -115,6 +144,20 @@ export class Scheduler {
       // A fast cron tick can fire again while we await preflight checks below;
       // without this, both invocations pass the has() guard above.
       this.running.add(automation.name);
+
+      if (this.honorCronFlags) {
+        let enabled = false;
+        try {
+          enabled = await isCronEnabled(this.history, automation.name);
+        } catch (err) {
+          logger.warn({ name: automation.name, err }, 'Cron skipped — failed to read enabled flag');
+        }
+        if (!enabled) {
+          logger.debug({ name: automation.name }, 'Cron skipped — disabled');
+          this.running.delete(automation.name);
+          return;
+        }
+      }
 
       const check = await this.checkThrottle(automation.name);
       if (!check.allowed) {

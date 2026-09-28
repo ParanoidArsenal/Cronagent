@@ -1,4 +1,4 @@
-import { getAutomations, saveAutomation, deleteAutomation, parseAutomationInput, getScheduler, setCronEnabled } from '@/lib/backend';
+import { getAutomations, saveAutomation, deleteAutomation, parseAutomationInput, setCronEnabled } from '@/lib/backend';
 
 export async function GET(
   _req: Request,
@@ -57,13 +57,11 @@ export async function DELETE(
   const { name } = await params;
   const decodedName = decodeURIComponent(name);
 
-  // Stop cron job before deleting the file
+  // Disable cron before deleting the file so the daemon stops firing it
   try {
-    const scheduler = await getScheduler();
-    scheduler.stopOne(decodedName);
     await setCronEnabled(decodedName, false);
   } catch {
-    // Scheduler may not be initialized (e.g. web-only mode) — continue with deletion
+    // DB may be unavailable — continue with deletion
   }
 
   const deleted = await deleteAutomation(decodedName);

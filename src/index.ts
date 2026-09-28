@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { loadAutomations } from './loader.js';
 import { Runner } from './runner.js';
 import { History } from './history.js';
-import { Scheduler } from './scheduler.js';
+import { Scheduler, isCronEnabled } from './scheduler.js';
 import { Composer, isComposedAutomation } from './composer.js';
 import { Notifier } from './notifier.js';
 import { SkipList } from './skip-list.js';
@@ -94,14 +94,15 @@ program
   .description('Start cron scheduler daemon')
   .action(async () => {
     const opts = program.opts();
-    const { scheduler, automations, history } = await setup(opts);
+    const { scheduler, automations, history } = await setup(opts, { daemon: true });
 
     scheduler.start(automations);
 
     const status = scheduler.getStatus();
     logger.info({ jobs: status.length }, 'Daemon running');
     for (const s of status) {
-      logger.info({ name: s.name, schedule: s.schedule, nextRun: s.nextRun }, 'Scheduled');
+      const enabled = await isCronEnabled(history, s.name);
+      logger.info({ name: s.name, schedule: s.schedule, nextRun: s.nextRun, enabled }, 'Scheduled');
     }
 
     // Graceful shutdown
@@ -200,7 +201,8 @@ program
 
 // ── Setup Helper ────────────────────────────────────────────
 
-async function setup(opts: Record<string, string>) {
+async function setup(opts: Record<string, string>, mode?: { daemon?: boolean }) {
+  const isDaemon = mode?.daemon ?? false;
   const automations = await loadAutomations(opts.dir);
   const notifier = new Notifier({
     webhookUrl: process.env.WEBHOOK_URL,
@@ -209,7 +211,9 @@ async function setup(opts: Record<string, string>) {
     mattermostWebhookUrl: process.env.MATTERMOST_WEBHOOK_URL,
   });
   const runner = new Runner(opts.mcp, true, notifier);
-  const history = await History.create(opts.databaseUrl, { sweepOrphans: true });
+  // Only the daemon may sweep every `running` row: `run`/`repl` would otherwise
+  // mark the daemon's in-flight runs as crashed. Others get the stale-only sweep.
+  const history = await History.create(opts.databaseUrl, { sweepOrphans: isDaemon });
   // Notify about runs that crashed before they could finalize themselves.
   await notifyOrphanedRuns(history, notifier);
   // Prune log files older than retention threshold.
@@ -217,7 +221,7 @@ async function setup(opts: Record<string, string>) {
   await pruneOldLogs(LOGS_DIR, retentionDays);
   const skipList = new SkipList(history);
   await skipList.prePopulate();
-  const scheduler = new Scheduler(runner, history, skipList, notifier);
+  const scheduler = new Scheduler(runner, history, skipList, notifier, { honorCronFlags: isDaemon });
 
   return { runner, history, scheduler, automations, notifier, skipList };
 }

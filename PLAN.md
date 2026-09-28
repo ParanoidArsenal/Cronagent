@@ -20,13 +20,14 @@ cronagent/
 │   ├── loader.ts          # Parse automation definitions
 │   ├── runner.ts          # Execute automations (shell, claude, MCP)
 │   ├── scheduler.ts       # Cron scheduling (reuse claude-cron's Scheduler)
-│   ├── history.ts         # SQLite execution log (reuse claude-cron's RunRepository)
+│   ├── history.ts         # PostgreSQL execution log, settings, MCP servers, env vars
 │   ├── composer.ts        # Chain automations together
 │   └── repl.ts            # Interactive REPL mode
 ├── mcp.json               # MCP servers (copy from ai-pipelines)
-├── config.yaml            # Global config (repos, credentials, defaults)
 └── package.json
 ```
+
+Configuration comes from environment variables (`.env`, see `.env.example`): `DATABASE_URL`, `AUTOMATIONS_DIR`, MCP/notification credentials. Env vars can also be managed from the web UI (stored in the `env_vars` table).
 
 ## Implementation
 
@@ -85,7 +86,7 @@ Two execution modes:
 
 Reuse:
 - `claude-cron/src/executor/executor.ts` — Claude CLI spawning, output capture, cost tracking
-- `claude-cron/src/storage/` — SQLite for execution history
+- `claude-cron/src/storage/` — execution history patterns (storage is PostgreSQL via `DATABASE_URL`)
 
 ### Step 4: Build the REPL
 **File:** `src/repl.ts`
@@ -136,7 +137,7 @@ Run: `npx --prefix ~/work/sandbox/cronagent cronagent run $ARGUMENTS`
 ## Verification
 1. Create 3 test automations: one shell-only, one Claude-mode, one composed
 2. Run each via REPL: `npx cronagent run <name>`
-3. Check SQLite history: `npx cronagent history`
+3. Check execution history (PostgreSQL): `npx cronagent history`
 4. Enable a cron job, verify it fires on schedule
 5. Chain two automations, verify context passes correctly
 

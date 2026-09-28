@@ -105,6 +105,88 @@ interface ServiceListResponse {
   records: CailaService[];
 }
 
+const HTTP_TIMEOUT_MS = (() => {
+  const n = Number(process.env.MCP_HTTP_TIMEOUT_MS);
+  return Number.isFinite(n) && n > 0 ? n : 30_000;
+})();
+
+function isTimeoutError(err: unknown): boolean {
+  return (
+    err instanceof Error &&
+    (err.name === "TimeoutError" || err.name === "AbortError")
+  );
+}
+
+// ==================== Argument validation ====================
+
+class ToolArgError extends Error {}
+
+/**
+ * Lightweight runtime check of tool arguments against the tool's own
+ * inputSchema (required fields + top-level primitive types + enum).
+ * Numeric strings are coerced for "number" fields and numbers for "string"
+ * fields. Throws ToolArgError.
+ */
+function validateArgs(
+  schema: { properties?: Record<string, any>; required?: string[] },
+  rawArgs: unknown
+): Record<string, any> {
+  if (rawArgs != null && (typeof rawArgs !== "object" || Array.isArray(rawArgs))) {
+    throw new ToolArgError("arguments must be an object");
+  }
+  const args: Record<string, any> = { ...((rawArgs as Record<string, any>) ?? {}) };
+  const props = schema.properties ?? {};
+  for (const key of schema.required ?? []) {
+    const v = args[key];
+    if (v === undefined || v === null || (typeof v === "string" && v.trim() === "")) {
+      throw new ToolArgError(`missing required argument '${key}'`);
+    }
+  }
+  for (const [key, def] of Object.entries(props)) {
+    const v = args[key];
+    if (v === undefined || v === null) continue;
+    const expected = def?.type;
+    let ok = true;
+    switch (expected) {
+      case "string":
+        if (typeof v === "number" && Number.isFinite(v)) args[key] = String(v);
+        ok = typeof args[key] === "string";
+        break;
+      case "number":
+      case "integer":
+        if (typeof v === "string" && v.trim() !== "" && Number.isFinite(Number(v))) {
+          args[key] = Number(v);
+        }
+        ok = typeof args[key] === "number" && Number.isFinite(args[key]) &&
+          (expected !== "integer" || Number.isInteger(args[key]));
+        break;
+      case "boolean":
+        ok = typeof v === "boolean";
+        break;
+      case "array":
+        ok = Array.isArray(v);
+        break;
+      case "object":
+        ok = typeof v === "object" && !Array.isArray(v);
+        break;
+    }
+    if (!ok) {
+      throw new ToolArgError(
+        `argument '${key}' must be of type ${expected}, got ${Array.isArray(v) ? "array" : typeof v}`
+      );
+    }
+    if (Array.isArray(def?.enum) && !def.enum.includes(args[key])) {
+      throw new ToolArgError(
+        `argument '${key}' must be one of: ${def.enum.join(", ")}`
+      );
+    }
+  }
+  return args;
+}
+
+/** Encode an LLM-supplied value for use as a single URL path segment. */
+const seg = (v: string | number) => encodeURIComponent(String(v));
+
 // HTTP request helper
 async function cailaRequest<T>(
   endpoint: string,
@@ -131,20 +213,31 @@ async function cailaRequest<T>(
     options.body = JSON.stringify(body);
   }
 
-  const response = await fetch(url, options);
+  options.signal = AbortSignal.timeout(HTTP_TIMEOUT_MS);
 
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`CAILA API error ${response.status}: ${errorText}`);
+  try {
+    const response = await fetch(url, options);
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`CAILA API error ${response.status}: ${errorText}`);
+    }
+
+    const contentType = response.headers.get("content-type");
+    if (contentType && contentType.includes("application/json")) {
+      return (await response.json()) as T;
+    }
+
+    // For text responses (like documentation)
+    return (await response.text()) as unknown as T;
+  } catch (err) {
+    if (isTimeoutError(err)) {
+      throw new Error(
+        `CAILA API ${method} ${endpoint}: request timed out after ${HTTP_TIMEOUT_MS}ms (set MCP_HTTP_TIMEOUT_MS to change)`
+      );
+    }
+    throw err;
   }
-
-  const contentType = response.headers.get("content-type");
-  if (contentType && contentType.includes("application/json")) {
-    return response.json() as Promise<T>;
-  }
-
-  // For text responses (like documentation)
-  return response.text() as unknown as T;
 }
 
 // Format helpers
@@ -267,8 +360,7 @@ const server = new Server(
   }
 );
 
-server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: [
+const TOOLS = [
     {
       name: "caila_list_public_services",
       description: `List all public services available on CAILA platform.
@@ -371,13 +463,33 @@ Searches through public services and returns matching results.`,
         required: ["query"],
       },
     },
-  ],
+];
+
+server.setRequestHandler(ListToolsRequestSchema, async () => ({
+  tools: TOOLS,
 }));
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args } = request.params;
+  const { name, arguments: rawArgs } = request.params;
 
   try {
+    const tool = TOOLS.find((t) => t.name === name);
+    let args: Record<string, any> | undefined = rawArgs;
+    if (tool) {
+      try {
+        args = validateArgs(tool.inputSchema, rawArgs);
+      } catch (err) {
+        if (err instanceof ToolArgError) {
+          return {
+            content: [
+              { type: "text", text: `Invalid arguments for ${name}: ${err.message}` },
+            ],
+            isError: true,
+          };
+        }
+        throw err;
+      }
+    }
     switch (name) {
       case "caila_list_public_services": {
         const { page = 0, size = 100, task_type, state } = args as {
@@ -389,7 +501,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         const effectiveSize = Math.min(size, 1000);
         const response = await cailaRequest<ServiceListResponse>(
-          `/api/mlpcore/models?onlyPublic=true&page=${page}&size=${effectiveSize}`
+          `/api/mlpcore/models?onlyPublic=true&page=${encodeURIComponent(String(page))}&size=${encodeURIComponent(String(effectiveSize))}`
         );
 
         let services = response.records;
@@ -445,10 +557,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         // Fetch service info and documentation in parallel
         const [service, doc] = await Promise.all([
           cailaRequest<CailaService>(
-            `/api/mlpcore/account/${account_id}/model/${model_id}`
+            `/api/mlpcore/account/${seg(account_id)}/model/${seg(model_id)}`
           ),
           cailaRequest<string>(
-            `/api/mlpcore/account/${account_id}/model/${model_id}/simple-doc`
+            `/api/mlpcore/account/${seg(account_id)}/model/${seg(model_id)}/simple-doc`
           ).catch(() => null), // Documentation may not exist
         ]);
 
@@ -471,7 +583,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
 
         const doc = await cailaRequest<string>(
-          `/api/mlpcore/account/${account_id}/model/${model_id}/simple-doc`
+          `/api/mlpcore/account/${seg(account_id)}/model/${seg(model_id)}/simple-doc`
         );
 
         if (!doc || doc.trim() === "") {

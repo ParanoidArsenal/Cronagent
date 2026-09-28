@@ -251,7 +251,7 @@ When a GitLab webhook fires, the automation receives these environment variables
 **GitLab webhook setup:**
 1. Go to your GitLab project → Settings → Webhooks
 2. URL: `https://<your-host>/api/webhook/gitlab`
-3. Secret token: value of `GITLAB_WEBHOOK_SECRET` from your `.env`
+3. Secret token: value of `GITLAB_WEBHOOK_SECRET` from your `.env` (**required** — if it is not set, the endpoint rejects every request with `503`; requests with a missing or wrong `X-Gitlab-Token` get `401`)
 4. Select events: Push, Merge request, Pipeline, etc.
 
 All `trigger: webhook` automations fire on every incoming event. The automation itself should check `GITLAB_EVENT_TYPE` and exit early if the event is irrelevant.

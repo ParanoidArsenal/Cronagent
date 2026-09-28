@@ -459,6 +459,43 @@ describe('Stream-JSON parsing — via Runner.execute()', () => {
 
   // ── ExecutionResult shape ───────────────────────────────────────────────────
 
+  describe('spend from failed attempts', () => {
+    /** Queue one mocked subprocess per attempt, in order. */
+    function queueAttempts(...attempts: Array<{ lines: string[]; exitCode?: number }>) {
+      const procs = attempts.map(({ lines, exitCode }) => {
+        mockClaudeStream(lines, exitCode ?? 0);
+        return mockExeca();
+      });
+      mockExeca.mockReset();
+      for (const proc of procs) mockExeca.mockReturnValueOnce(proc);
+    }
+
+    it('reports cost of a failed run (non-zero exit after spending tokens)', async () => {
+      queueAttempts({
+        lines: [resultEvent({ result: 'partial', total_cost_usd: 0.01, usage: { input_tokens: 100, output_tokens: 10 } })],
+        exitCode: 1,
+      });
+      const result = await runner.execute(makeAutomation());
+      expect(result.success).toBe(false);
+      expect(result.costUsd).toBeCloseTo(0.01);
+      expect(result.inputTokens).toBe(100);
+      expect(result.outputTokens).toBe(10);
+    });
+
+    it('sums cost across a failed attempt and the successful retry', async () => {
+      queueAttempts(
+        { lines: [resultEvent({ is_error: true, error: 'boom', total_cost_usd: 0.01, usage: { input_tokens: 100, output_tokens: 10 } })] },
+        { lines: [resultEvent({ result: 'done', total_cost_usd: 0.02, usage: { input_tokens: 200, output_tokens: 20 } })] },
+      );
+      const result = await runner.execute(makeAutomation({ maxRetries: 1, retryDelayMs: 1 }));
+      expect(result.success).toBe(true);
+      expect(result.totalAttempts).toBe(2);
+      expect(result.costUsd).toBeCloseTo(0.03);
+      expect(result.inputTokens).toBe(300);
+      expect(result.outputTokens).toBe(30);
+    });
+  });
+
   describe('ExecutionResult fields', () => {
     it('marks result as success:true on a clean run', async () => {
       mockClaudeStream([resultEvent({ result: 'ok', total_cost_usd: 0.001 })]);

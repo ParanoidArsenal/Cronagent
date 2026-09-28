@@ -1,6 +1,7 @@
 import { getMcpServer } from '@/lib/backend';
 import { McpForm } from '@/components/mcp-form';
 import { notFound } from 'next/navigation';
+import { redactEnv } from '@/app/mcp/mcp-secrets';
 import { getTranslations } from 'next-intl/server';
 
 export const dynamic = 'force-dynamic';
@@ -28,7 +29,7 @@ export default async function EditMcpServerPage({
           name: server.name,
           command: server.command,
           args: server.args,
-          env: server.env,
+          env: redactEnv(server.env),
           enabled: server.enabled,
         }}
       />

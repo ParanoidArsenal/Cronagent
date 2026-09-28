@@ -297,11 +297,23 @@ describe('Claude CLI invocation', () => {
       expect(args).toContain('--rm');
     });
 
-    it('sets --network host for API access', async () => {
+    it('uses the isolated bridge network by default (not host)', async () => {
       await runner.execute(makeAutomation({ sandbox: true }));
       const { args } = getExecaCall();
       const idx = args.indexOf('--network');
-      expect(args[idx + 1]).toBe('host');
+      expect(args[idx + 1]).toBe('bridge');
+    });
+
+    it('honours SANDBOX_NETWORK override', async () => {
+      process.env.SANDBOX_NETWORK = 'cronagent-sandbox-net';
+      try {
+        await runner.execute(makeAutomation({ sandbox: true }));
+        const { args } = getExecaCall();
+        const idx = args.indexOf('--network');
+        expect(args[idx + 1]).toBe('cronagent-sandbox-net');
+      } finally {
+        delete process.env.SANDBOX_NETWORK;
+      }
     });
 
     it('limits memory to 1g', async () => {

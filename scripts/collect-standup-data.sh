@@ -13,7 +13,7 @@ REPOS=(
 )
 
 # Try to load standup.conf
-for conf in ./standup.conf /app/standup.conf /app/standup.conf; do
+for conf in ./standup.conf /app/standup.conf; do
   if [ -f "$conf" ]; then
     _email=$(grep -E '^AUTHOR_EMAIL=' "$conf" 2>/dev/null | head -1 | cut -d= -f2-)
     [ -n "$_email" ] && AUTHOR_EMAIL="$_email"
